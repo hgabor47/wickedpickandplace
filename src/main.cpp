@@ -280,6 +280,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   textarea { width:100%; height:220px; background:#000; color:#0f0; font-family:Consolas,monospace; font-size:13px; }
   #out { white-space:pre-wrap; background:#000; color:#0f0; padding:8px; margin-top:8px; min-height:120px; }
   button { padding:8px 16px; margin-top:8px; }
+  .quick button { margin-right:8px; }
   h2 { color:#eee; font-family:sans-serif; }
   .hint { color:#888; font-size:12px; }
 </style></head><body>
@@ -289,14 +290,24 @@ setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
 <textarea id="src" placeholder="setCell 1,100001,{70,70,1,1},..."></textarea><br>
 <button onclick="run()">Futtat</button>
+<div class="quick">
+  <button onclick="quick('testMotor 0,200')">motor1</button>
+  <button onclick="quick('testMotor 1,200')">motor2</button>
+  <button onclick="quick('testMagnet 100,3')">magnet100</button>
+  <button onclick="quick('testMagnet 50,3')">magnet50</button>
+</div>
 <div id="out"></div>
 <script>
-function run() {
-  const body = document.getElementById('src').value;
+function send(body) {
   fetch('/cmd', { method: 'POST', body: body })
     .then(r => r.text())
     .then(t => document.getElementById('out').textContent = t)
     .catch(e => document.getElementById('out').textContent = 'HIBA: ' + e);
+}
+function quick(cmdLine) { send(cmdLine); }
+function run() {
+  const body = document.getElementById('src').value;
+  send(body);
 }
 </script>
 </body></html>
