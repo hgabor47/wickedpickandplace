@@ -37,17 +37,56 @@
 // Gomb 6 = GPIO23 (belső + külső 4.7k pull-up), a többi a sémának megfelelő.
 const int buttonPins[8] = {4, 5, 18, 19, 34, 23, 36, 39};
 bool lastButtonState[8]  = {true, true, true, true, true, true, true, true};
+bool stableState[8]      = {true, true, true, true, true, true, true, true};
 unsigned long lastDebounceTime[8] = {0};
 const unsigned long debounceDelay = 30;
 String codeBuffer = "";
 
+// gomb-index nevek olvashatosaghoz (0-alapu, buttonPins/stableState indexei)
+const int BTN1 = 0, BTN2 = 1, BTN3 = 2, BTN4 = 3, BTN5 = 4, BTN6 = 5, BTN7 = 6, BTN8 = 7;
+
+// ============ PLAY / EDIT MOD ============
+enum AppMode : uint8_t { MODE_PLAY = 0, MODE_EDIT = 1 };
+enum EditSubMode : uint8_t { EDIT_MENU = 0, EDIT_SETUP = 1, EDIT_ORIGIN = 2, EDIT_MOVE = 3, EDIT_CELLS = 4, EDIT_PATH = 5 };
+AppMode appMode = MODE_PLAY;
+EditSubMode editSubMode = EDIT_MENU;
+
+// tobbszori gyors egymas utani lenyomas szamlalasa (8x mod-valtas, 3x ESC)
+unsigned long tapLastTime[8] = {0};
+int tapCount[8] = {0};
+const unsigned long TAP_WINDOW_MS = 700;
+
+// az EDIT menuben a 3-as gomb ketfele jelentesenek (1x=belepes SETUP-ba, 8x=vissza
+// PLAY-be) szetvalasztasahoz kell egy rovid, fuggo allapotu keslekedes - a SETUP-ba
+// lepest csak akkor hajtjuk vegre, ha a keslekedesi ablak alatt nem jon meg 8 koppintas.
+bool pendingSetupEntry = false;
+unsigned long pendingSetupEntryTime = 0;
+const unsigned long MENU_COMMIT_DELAY_MS = 450;
+
+// Ugyanez a problema SETUP-on belul: gomb3 1x = XMAX,0 sarok tarolasa, 3x = ESC.
+// A tarolast csak akkor hajtjuk vegre, ha a keslekedesi ablak alatt nem jon meg
+// harmadik koppintas (lasd updatePendingMenuActions()).
+bool pendingSetupCornerStore = false;
+unsigned long pendingSetupCornerTime = 0;
+
 // ============ GÉP GEOMETRIA ============
 const float ANCHOR_A_X = -200, ANCHOR_A_Y = -200;
 const float ANCHOR_B_X =  920, ANCHOR_B_Y = -200;
-const float STEPS_PER_MM = 80.0;
 
-const float SPEED_TRAVEL = 120.0;
-const float SPEED_CARRY  = 60.0;
+// Motor: 1.8 fok/lepes (200 lepes/fordulat). A4988 microstepping: MS2 +3.3V-ra
+// kotve -> 1/4 step (MS1/MS3 GND-n). Ha az MS1/2/3 bekotes valtozik, csak ezt
+// az egy konstanst kell modositani (1=full, 2=half, 4=quarter, 8=1/8, 16=1/16).
+const float MICROSTEPPING = 4.0;
+// Orso atmero (kozepertek, csavarodo zsinorral): 20mm -> kerulet = pi*20 =~ 62.83mm/fordulat.
+const float MOTOR_STEPS_PER_REV = 200.0;
+const float SPOOL_DIAMETER_MM   = 20.0;
+const float STEPS_PER_MM = (MOTOR_STEPS_PER_REV * MICROSTEPPING) / (PI * SPOOL_DIAMETER_MM); // =~ 12.73
+
+const float SPEED_TRAVEL = 50.0;   // mm/s - ures kocsi (nem penDown)
+const float SPEED_CARRY  = 25.0;   // mm/s - targy szallitasa (penDown)
+const float ACCEL_MM_S2  = 400.0;  // mm/s^2 - fo mozgas gyorsulasa/lassulasa
+const float TESTMOTOR_SPEED_MM_S  = 20.0;  // testMotor diagnosztika sebessege
+const float TESTMOTOR_ACCEL_MM_S2 = 300.0;
 
 // ============ ELEKTROMÁGNES PWM PARAMÉTEREK (core 2.x LEDC API) ============
 const int PWM_CHANNEL   = 0;
@@ -357,6 +396,9 @@ void computeStringLengths(float x, float y, float &lenA, float &lenB) {
 }
 
 long mmToSteps(float mm) { return (long)round(mm * STEPS_PER_MM); }
+// Sebesseg/gyorsulas mm/s (^2) -> steps/s (^2), ugyanazzal a linearis skalazassal mint a pozicio.
+uint32_t mmSpeedToStepsHz(float mmPerSec)   { return (uint32_t)max(1L, (long)round(mmPerSec * STEPS_PER_MM)); }
+uint32_t mmAccelToStepsS2(float mmPerSec2)  { return (uint32_t)max(1L, (long)round(mmPerSec2 * STEPS_PER_MM)); }
 
 void moveTo(float x, float y, float speedMmPerSec) {
   float lenA, lenB, curLenA, curLenB;
@@ -379,8 +421,8 @@ void moveTo(float x, float y, float speedMmPerSec) {
 
   motorA->setSpeedInHz(speedA);
   motorB->setSpeedInHz(speedB);
-  motorA->setAcceleration(4000);
-  motorB->setAcceleration(4000);
+  motorA->setAcceleration(mmAccelToStepsS2(ACCEL_MM_S2));
+  motorB->setAcceleration(mmAccelToStepsS2(ACCEL_MM_S2));
   motorA->moveTo(targetStepsA);
   motorB->moveTo(targetStepsB);
 
@@ -471,8 +513,8 @@ void executeMotorTest(const QueueItem &item) {
   webLogf("Motor%d teszt inditasa: pozicio=%ld, isRunning=%d, celSteps=%ld",
           item.motorIndex, posBefore, wasRunningBefore, item.testSteps);
 
-  mot->setSpeedInHz(2000);
-  mot->setAcceleration(4000);
+  mot->setSpeedInHz(mmSpeedToStepsHz(TESTMOTOR_SPEED_MM_S));
+  mot->setAcceleration(mmAccelToStepsS2(TESTMOTOR_ACCEL_MM_S2));
 
   MoveResultCode result1 = mot->move(item.testSteps, true); // blokkolo relativ mozgas oda
   long posAfterForward = mot->getCurrentPosition();
@@ -562,10 +604,393 @@ void handleDigit(char digit) {
   }
 }
 
+// =====================================================================
+//  EDIT MOD - KALIBRACIOS RACS
+//  A gombkod-alapu PLAY mod valtozatlan marad. Az EDIT mod egy uj,
+//  fuggetlen also-szintu koordinatarendszert epit fel: a motorA ("LEFT",
+//  A-horgony) es motorB ("RIGHT", B-horgony) nyers lepesszamai alapjan,
+//  a SETUP-ban rogzitett 4 sarokpontbol bilinearis interpolacioval
+//  szamolva - igy nem kell megbizni a hardkodolt ANCHOR_A/B / STEPS_PER_MM
+//  allandokban, azokat a SETUP+ORIGIN kalibracio valtja ki.
+// =====================================================================
+#define GRID_COLS        7
+#define GRID_ROWS        5
+#define GRID_CELL_COUNT  (GRID_COLS * GRID_ROWS)
+
+// sarokindex: 0=(0,0) 1=(0,YMAX) 2=(XMAX,0) 3=(XMAX,YMAX)
+long gridCornerA[4] = {0};
+long gridCornerB[4] = {0};
+uint8_t gridCornerMask = 0; // bit(i)=1, ha az i. sarok mar el van mentve
+
+long gridCellA[GRID_CELL_COUNT] = {0};
+long gridCellB[GRID_CELL_COUNT] = {0};
+bool gridCellsComputed = false;
+
+float moveU = 0.5f, moveV = 0.5f; // MOVE/CELLS almod aktualis normalizalt (0..1) pozicioja
+
+void saveGridCorners() {
+  prefs.putBytes("gridCornA", gridCornerA, sizeof(gridCornerA));
+  prefs.putBytes("gridCornB", gridCornerB, sizeof(gridCornerB));
+  prefs.putUChar("gridCornMask", gridCornerMask);
+}
+
+void loadGridCorners() {
+  size_t lenA = prefs.getBytes("gridCornA", gridCornerA, sizeof(gridCornerA));
+  size_t lenB = prefs.getBytes("gridCornB", gridCornerB, sizeof(gridCornerB));
+  gridCornerMask = prefs.getUChar("gridCornMask", 0);
+  if (lenA != sizeof(gridCornerA) || lenB != sizeof(gridCornerB)) gridCornerMask = 0;
+}
+
+void saveGridCells() {
+  prefs.putBytes("gridCellA", gridCellA, sizeof(gridCellA));
+  prefs.putBytes("gridCellB", gridCellB, sizeof(gridCellB));
+}
+
+void loadGridCells() {
+  size_t lenA = prefs.getBytes("gridCellA", gridCellA, sizeof(gridCellA));
+  size_t lenB = prefs.getBytes("gridCellB", gridCellB, sizeof(gridCellB));
+  gridCellsComputed = (lenA == sizeof(gridCellA) && lenB == sizeof(gridCellB));
+}
+
+long bilerpLong(long v00, long v10, long v01, long v11, float u, float v) {
+  double top = v00 + (double)(v10 - v00) * u;
+  double bot = v01 + (double)(v11 - v01) * u;
+  return (long)round(top + (bot - top) * v);
+}
+
+// u: 0=X-min .. 1=X-max oldal, v: 0=Y-min .. 1=Y-max oldal
+void gridTargetForUV(float u, float v, long &outA, long &outB) {
+  outA = bilerpLong(gridCornerA[0], gridCornerA[2], gridCornerA[1], gridCornerA[3], u, v);
+  outB = bilerpLong(gridCornerB[0], gridCornerB[2], gridCornerB[1], gridCornerB[3], u, v);
+}
+
+void computeDefaultGridCells() {
+  for (int row = 0; row < GRID_ROWS; row++) {
+    for (int col = 0; col < GRID_COLS; col++) {
+      float u = (col + 0.5f) / GRID_COLS;
+      float v = (row + 0.5f) / GRID_ROWS;
+      int idx = row * GRID_COLS + col;
+      gridTargetForUV(u, v, gridCellA[idx], gridCellB[idx]);
+    }
+  }
+  gridCellsComputed = true;
+  saveGridCells();
+}
+
+// ============ ACK VISSZAJELZES: motor oda-vissza mozgatas gombnyomasra ============
+const float ACK_SPEED_MM_S  = 40.0;
+const float ACK_ACCEL_MM_S2 = 400.0;
+
+void ackPulse(FastAccelStepper *mot, int times) {
+  if (!mot) return;
+  long amplitude = mmToSteps(1);
+  mot->setSpeedInHz(mmSpeedToStepsHz(ACK_SPEED_MM_S));
+  mot->setAcceleration(mmAccelToStepsS2(ACK_ACCEL_MM_S2));
+  for (int t = 0; t < times; t++) {
+    mot->move(amplitude, true);
+    mot->move(-amplitude, true);
+  }
+}
+void ackLeft(int times)  { ackPulse(motorA, times); }  // motorA = A-horgony ("LEFT")
+void ackRight(int times) { ackPulse(motorB, times); }  // motorB = B-horgony ("RIGHT")
+
+// ============ NYERS MOTOR-JOG (SETUP/ORIGIN): nyomva tartas alatt folyamatos ============
+const float JOG_SPEED_MM_S  = 80.0;
+const float JOG_ACCEL_MM_S2 = 500.0;
+
+void jogMotorStart(FastAccelStepper *mot, int dir) {
+  mot->setSpeedInHz(mmSpeedToStepsHz(JOG_SPEED_MM_S));
+  mot->setAcceleration(mmAccelToStepsS2(JOG_ACCEL_MM_S2));
+  if (dir > 0) mot->runForward(); else mot->runBackward();
+}
+void jogMotorStop(FastAccelStepper *mot) {
+  mot->stopMove();
+}
+
+// ============ MOVE/CELLS JOG: kalibralt racs-terben, normalizalt (u,v) ============
+void moveJogApply() {
+  if (gridCornerMask != 0x0F) return;
+  long ta, tb;
+  gridTargetForUV(moveU, moveV, ta, tb);
+  motorA->setSpeedInHz(mmSpeedToStepsHz(JOG_SPEED_MM_S));
+  motorB->setSpeedInHz(mmSpeedToStepsHz(JOG_SPEED_MM_S));
+  motorA->setAcceleration(mmAccelToStepsS2(JOG_ACCEL_MM_S2));
+  motorB->setAcceleration(mmAccelToStepsS2(JOG_ACCEL_MM_S2));
+  motorA->moveTo(ta);
+  motorB->moveTo(tb);
+}
+
+// A loop()-bol minden ciklusban hivva - amig LEFT/RIGHT/UP/DOWN nyomva van,
+// folyamatosan (de valos ido szerint mert, nem tick-szamtol fuggoen) kozeliti
+// a celt a kalibralt racs-terben; elengedeskor azonnal megallitja a motort,
+// nehogy egy korabban kiadott tavoli moveTo()-cel fele tovabb fusson.
+const float JOG_RATE_PER_SEC = 0.15f; // a 0..1 racs-tartomany ennyi resze/mp
+void updateMoveJogTick() {
+  if (appMode != MODE_EDIT) return;
+  if (editSubMode != EDIT_MOVE && editSubMode != EDIT_CELLS) return;
+
+  static unsigned long lastTickMs = 0;
+  static bool jogWasActive = false;
+  unsigned long now = millis();
+  float dt = (lastTickMs == 0) ? 0.0f : (now - lastTickMs) / 1000.0f;
+  lastTickMs = now;
+
+  bool anyHeld = (stableState[BTN8] == LOW) || (stableState[BTN2] == LOW) ||
+                 (stableState[BTN4] == LOW) || (stableState[BTN5] == LOW);
+  if (!anyHeld) {
+    if (jogWasActive) {
+      motorA->stopMove();
+      motorB->stopMove();
+      jogWasActive = false;
+    }
+    return;
+  }
+  jogWasActive = true;
+
+  float delta = JOG_RATE_PER_SEC * dt;
+  if (stableState[BTN8] == LOW) moveU -= delta; // LEFT
+  if (stableState[BTN2] == LOW) moveU += delta; // RIGHT
+  if (stableState[BTN4] == LOW) moveV -= delta; // UP
+  if (stableState[BTN5] == LOW) moveV += delta; // DOWN
+  moveU = constrain(moveU, 0.0f, 1.0f);
+  moveV = constrain(moveV, 0.0f, 1.0f);
+  moveJogApply();
+}
+
+// Az EDIT menu SETUP-belepes (3-as gomb 1x) fuggoben tartasat zarja le, ha
+// letelt a keslekedesi ablak es kozben nem erkezett meg 8 koppintas (lasd fent).
+void storeCorner(int cornerIdx, const char *label);
+
+void updatePendingMenuActions() {
+  if (pendingSetupEntry && millis() - pendingSetupEntryTime >= MENU_COMMIT_DELAY_MS) {
+    pendingSetupEntry = false;
+    if (appMode == MODE_EDIT && editSubMode == EDIT_MENU) {
+      editSubMode = EDIT_SETUP;
+      webLog("EDIT almod: SETUP");
+      ackRight(2);
+    }
+  }
+  if (pendingSetupCornerStore && millis() - pendingSetupCornerTime >= MENU_COMMIT_DELAY_MS) {
+    pendingSetupCornerStore = false;
+    if (appMode == MODE_EDIT && editSubMode == EDIT_SETUP) {
+      storeCorner(2, "(XMAX,0)");
+    }
+  }
+}
+
+// ============ EDIT ALMOD: SETUP ============
+void storeCorner(int cornerIdx, const char *label) {
+  gridCornerA[cornerIdx] = motorA->getCurrentPosition();
+  gridCornerB[cornerIdx] = motorB->getCurrentPosition();
+  gridCornerMask |= (1 << cornerIdx);
+  saveGridCorners();
+  webLogf("SETUP: sarok '%s' tarolva (A=%ld, B=%ld)", label, gridCornerA[cornerIdx], gridCornerB[cornerIdx]);
+  ackRight(1);
+  if (gridCornerMask == 0x0F) {
+    computeDefaultGridCells();
+    webLog("SETUP: mind a 4 sarok megvan - cellaracs (ujra)szamolva.");
+  }
+}
+
+void setupHandlePress(int i) {
+  switch (i) {
+    case BTN6: storeCorner(0, "(0,0)");       break;
+    case BTN7: storeCorner(1, "(0,YMAX)");    break;
+    // BTN3 (XMAX,0) nincs itt: az onButtonPressed fuggoben tartja (lasd
+    // pendingSetupCornerStore), mert 3x lenyomas ESC-et jelent.
+    case BTN1: storeCorner(3, "(XMAX,YMAX)"); break;
+    case BTN5: jogMotorStart(motorA, -1); break; // LEFT motor
+    case BTN8: jogMotorStart(motorA, +1); break; // LEFT motor
+    case BTN2: jogMotorStart(motorB, -1); break; // RIGHT motor
+    case BTN4: jogMotorStart(motorB, +1); break; // RIGHT motor
+    default: break;
+  }
+}
+
+void setupHandleRelease(int i) {
+  switch (i) {
+    case BTN5: case BTN8: jogMotorStop(motorA); break;
+    case BTN2: case BTN4: jogMotorStop(motorB); break;
+    default: break;
+  }
+}
+
+// ============ EDIT ALMOD: ORIGIN ============
+void originConfirm() {
+  if (gridCornerMask != 0x0F) {
+    webLog("ORIGIN: HIBA - a SETUP meg nincs kesz (nincs mind a 4 sarok elmentve).");
+    return;
+  }
+  motorA->setCurrentPosition(gridCornerA[0]);
+  motorB->setCurrentPosition(gridCornerB[0]);
+  webLogf("ORIGIN: kalibralva a (0,0) sarokhoz (A=%ld, B=%ld).", gridCornerA[0], gridCornerB[0]);
+  ackRight(2);
+}
+
+void originHandlePress(int i) {
+  switch (i) {
+    case BTN1: originConfirm(); break;
+    case BTN5: jogMotorStart(motorA, -1); break;
+    case BTN8: jogMotorStart(motorA, +1); break;
+    case BTN2: jogMotorStart(motorB, -1); break;
+    case BTN4: jogMotorStart(motorB, +1); break;
+    default: break;
+  }
+}
+
+void originHandleRelease(int i) {
+  switch (i) {
+    case BTN5: case BTN8: jogMotorStop(motorA); break;
+    case BTN2: case BTN4: jogMotorStop(motorB); break;
+    default: break;
+  }
+}
+
+// ============ EDIT ALMOD: MOVE ============
+void moveHandlePress(int i) {
+  switch (i) {
+    case BTN6: engageMagnet(); break; // momentary - amig nyomva tartjuk
+    case BTN1:
+      webLogf("MOVE: pozicio u=%.3f v=%.3f (A=%ld, B=%ld)",
+              moveU, moveV, motorA->getCurrentPosition(), motorB->getCurrentPosition());
+      break;
+    default: break; // BTN8/2/4/5 jog - lasd updateMoveJogTick()
+  }
+}
+
+void moveHandleRelease(int i) {
+  if (i == BTN6) releaseMagnet();
+}
+
+// ============ EDIT ALMOD: CELLS ============
+void cellsStoreNearest() {
+  if (gridCornerMask != 0x0F) { webLog("CELLS: HIBA - a SETUP meg nincs kesz."); return; }
+  long curA = motorA->getCurrentPosition();
+  long curB = motorB->getCurrentPosition();
+  int best = -1;
+  double bestDist = 1e18;
+  for (int idx = 0; idx < GRID_CELL_COUNT; idx++) {
+    double dA = (double)(curA - gridCellA[idx]);
+    double dB = (double)(curB - gridCellB[idx]);
+    double dist = dA * dA + dB * dB;
+    if (dist < bestDist) { bestDist = dist; best = idx; }
+  }
+  gridCellA[best] = curA;
+  gridCellB[best] = curB;
+  saveGridCells();
+  webLogf("CELLS: cella #%d (sor %d, oszlop %d) pozicioja frissitve (A=%ld, B=%ld).",
+          best, best / GRID_COLS, best % GRID_COLS, curA, curB);
+  ackRight(1);
+}
+
+void cellsHandlePress(int i) {
+  switch (i) {
+    case BTN6: engageMagnet(); break; // momentary - amig nyomva tartjuk
+    case BTN1: cellsStoreNearest(); break;
+    default: break; // BTN8/2/4/5 jog - lasd updateMoveJogTick()
+  }
+}
+
+void cellsHandleRelease(int i) {
+  if (i == BTN6) releaseMagnet();
+}
+
+// ============ EDIT FOMENU + MOD-VALTAS ============
+void enterEditSubMode(EditSubMode m, const char *name) {
+  editSubMode = m;
+  webLogf("EDIT almod: %s", name);
+  ackRight(2);
+}
+
+void onButtonPressed(int i) {
+  unsigned long now = millis();
+  if (now - tapLastTime[i] > TAP_WINDOW_MS) tapCount[i] = 0;
+  tapCount[i]++;
+  tapLastTime[i] = now;
+
+  if (appMode == MODE_PLAY) {
+    if (i == BTN6 && tapCount[BTN6] == 8) {
+      appMode = MODE_EDIT;
+      editSubMode = EDIT_MENU;
+      codeBuffer = "";
+      tapCount[BTN6] = 0;
+      webLog("EDIT mod aktivalva (gomb6 x8).");
+      ackLeft(2);
+      return;
+    }
+    handleDigit('1' + i);
+    return;
+  }
+
+  // MODE_EDIT
+  if (editSubMode == EDIT_MENU) {
+    if (i == BTN3) {
+      if (tapCount[BTN3] == 8) {
+        pendingSetupEntry = false;
+        appMode = MODE_PLAY;
+        tapCount[BTN3] = 0;
+        webLog("PLAY mod aktivalva (gomb3 x8).");
+        ackRight(4);
+        return;
+      }
+      // 1x = belepes SETUP-ba, de lehet, hogy meg jon tobb koppintas 8x-ig -
+      // ezert csak fuggoben jelezzuk, lasd updatePendingMenuActions().
+      pendingSetupEntry = true;
+      pendingSetupEntryTime = now;
+      return;
+    }
+    switch (i) {
+      case BTN1: enterEditSubMode(EDIT_PATH,   "PATH");   break;
+      case BTN2: enterEditSubMode(EDIT_CELLS,  "CELLS");  break;
+      case BTN5: enterEditSubMode(EDIT_ORIGIN, "ORIGIN"); break;
+      case BTN8: enterEditSubMode(EDIT_MOVE,   "MOVE");   break;
+      default: break;
+    }
+    return;
+  }
+
+  // Kozos ESC minden almodban: gomb3 x3 egymas utan
+  if (i == BTN3 && tapCount[BTN3] == 3) {
+    tapCount[BTN3] = 0;
+    pendingSetupCornerStore = false; // ne fusson le kesobb egy mar ervenytelenitett tarolas
+    editSubMode = EDIT_MENU;
+    webLog("Vissza az EDIT menube (ESC x3).");
+    ackLeft(2);
+    return;
+  }
+
+  // SETUP-ban a gomb3-nak is ketfele jelentese van (1x=XMAX,0 tarolas, 3x=ESC
+  // fentebb), ezert ugyanugy fuggoben tartjuk, mint az EDIT menu SETUP-belepeset.
+  if (editSubMode == EDIT_SETUP && i == BTN3) {
+    pendingSetupCornerStore = true;
+    pendingSetupCornerTime = now;
+    return;
+  }
+
+  switch (editSubMode) {
+    case EDIT_SETUP:  setupHandlePress(i);  break;
+    case EDIT_ORIGIN: originHandlePress(i); break;
+    case EDIT_MOVE:   moveHandlePress(i);   break;
+    case EDIT_CELLS:  cellsHandlePress(i);  break;
+    case EDIT_PATH:   break; // meg nincs kifejtve - csak a belepes logolodik
+    default: break;
+  }
+}
+
+void onButtonReleased(int i) {
+  if (appMode != MODE_EDIT) return;
+  switch (editSubMode) {
+    case EDIT_SETUP:  setupHandleRelease(i);  break;
+    case EDIT_ORIGIN: originHandleRelease(i); break;
+    case EDIT_MOVE:   moveHandleRelease(i);   break;
+    case EDIT_CELLS:  cellsHandleRelease(i);  break;
+    default: break;
+  }
+}
+
 // Ez most a loop()-ból (Core1) fut - mozgástól teljesen fuggetlenul, igy
 // mindig, mozgas kozben is azonnal reagal.
 void scanButtonsAndDispatch() {
-  static bool stableState[8] = {true,true,true,true,true,true,true,true};
   for (int i = 0; i < 8; i++) {
     bool reading = digitalRead(buttonPins[i]);
     if (reading != lastButtonState[i]) lastDebounceTime[i] = millis();
@@ -574,7 +999,9 @@ void scanButtonsAndDispatch() {
         stableState[i] = reading;
         if (reading == LOW) {
           webLogf("Gomb %d lenyomva (GPIO%d)", i + 1, buttonPins[i]);
-          handleDigit('1' + i);
+          onButtonPressed(i);
+        } else {
+          onButtonReleased(i);
         }
       }
     }
@@ -783,6 +1210,11 @@ void setup() {
     loadAllCells();
   }
 
+  loadGridCorners();
+  loadGridCells();
+  webLogf("EDIT kalibracio: sarkak=%d/4, cellaracs=%s", __builtin_popcount(gridCornerMask),
+          gridCellsComputed ? "betoltve" : "nincs");
+
   // ---- Mozgas-queue ----
   motionQueue = xQueueCreate(MOTION_QUEUE_LEN, sizeof(QueueItem));
 
@@ -906,5 +1338,7 @@ void loop() {
   ElegantOTA.loop();
   ArduinoOTA.handle();
   scanButtonsAndDispatch(); // Core1 - fuggetlen a mozgas-magtol, mindig fut
+  updateMoveJogTick();
+  updatePendingMenuActions();
   delay(2);
 }
