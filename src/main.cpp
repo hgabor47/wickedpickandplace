@@ -438,14 +438,69 @@ void executeQueueSequence(const QueueItem &item) {
   }
 }
 
+// ============ MOTOR-DIAGNOSZTIKA ============
+// Célja: egyértelműen szétválasztani, hogy a hiba a szoftver/könyvtár
+// rétegben van-e (motor objektum, engine, enable-logika), vagy tisztán
+// hardver szinten (STEP-jel nem jut ki, driver, tekercs, táp).
+// - A move() visszatérési értékét is naplózzuk: ha ez false, a könyvtár már
+//   a hívás pillanatában elutasította a parancsot.
+// - A pozíciószámlálót (getCurrentPosition()) mozgás előtt/után kiírjuk: ha
+//   ez ténylegesen elmozdul, a szoftver-oldal biztosan jó, a hiba hardver.
+// A MoveResultCode enumot olvashato szoveggé alakitja a loghoz.
+const char* moveResultToStr(MoveResultCode code) {
+  switch (code) {
+    case MOVE_OK: return "MOVE_OK";
+    case MOVE_ERR_SPEED_IS_UNDEFINED: return "MOVE_ERR_SPEED_IS_UNDEFINED";
+    case MOVE_ERR_NO_DIRECTION_PIN: return "MOVE_ERR_NO_DIRECTION_PIN";
+#ifdef MOVE_ERR_SPEED_TOO_LOW
+    case MOVE_ERR_SPEED_TOO_LOW: return "MOVE_ERR_SPEED_TOO_LOW";
+#endif
+    default: return "ISMERETLEN_HIBAKOD";
+  }
+}
+
 void executeMotorTest(const QueueItem &item) {
   FastAccelStepper *mot = (item.motorIndex == 0) ? motorA : motorB;
-  if (!mot) return;
+  if (!mot) {
+    webLogf("MOTOR TESZT HIBA: motor%d pointer NULL - az engine.stepperConnectToPin() nem sikerult a setup()-ban!", item.motorIndex);
+    return;
+  }
+
+  bool wasRunningBefore = mot->isRunning();
+  long posBefore = mot->getCurrentPosition();
+  webLogf("Motor%d teszt inditasa: pozicio=%ld, isRunning=%d, celSteps=%ld",
+          item.motorIndex, posBefore, wasRunningBefore, item.testSteps);
+
   mot->setSpeedInHz(2000);
   mot->setAcceleration(4000);
-  mot->move(item.testSteps, true);   // blokkoló relatív mozgás
+
+  MoveResultCode result1 = mot->move(item.testSteps, true); // blokkolo relativ mozgas oda
+  long posAfterForward = mot->getCurrentPosition();
+  webLogf("Motor%d oda: move()=%s, pozicio %ld -> %ld (delta=%ld, elvart=%ld)",
+          item.motorIndex, moveResultToStr(result1),
+          posBefore, posAfterForward, posAfterForward - posBefore, item.testSteps);
+
   delay(200);
-  mot->move(-item.testSteps, true);  // vissza
+
+  MoveResultCode result2 = mot->move(-item.testSteps, true); // vissza
+  long posAfterBack = mot->getCurrentPosition();
+  webLogf("Motor%d vissza: move()=%s, pozicio %ld -> %ld (delta=%ld, elvart=%ld)",
+          item.motorIndex, moveResultToStr(result2),
+          posAfterForward, posAfterBack, posAfterBack - posAfterForward, -item.testSteps);
+
+  // Osszegzo ertekeles - ez adja meg a leggyorsabb valaszt a kerdesre:
+  // szoftver vagy hardver oldalon van-e a hiba.
+  bool positionMovedAsExpected =
+    (posAfterForward - posBefore == item.testSteps) &&
+    (posAfterBack - posAfterForward == -item.testSteps);
+
+  if (result1 != MOVE_OK || result2 != MOVE_OK) {
+    webLogf("Motor%d OSSZEGZES: a konyvtar ELUTASITOTTA a mozgast - SZOFTVER/KONYVTAR oldali hiba valoszinu (engine init, motor objektum, enable-logika).", item.motorIndex);
+  } else if (!positionMovedAsExpected) {
+    webLogf("Motor%d OSSZEGZES: a move() OK-t adott vissza, de a pozicioszamlalo NEM a vart merteket valtozott - ez szokatlan, ellenorizd az engine/queue konfiguraciot.", item.motorIndex);
+  } else {
+    webLogf("Motor%d OSSZEGZES: a pozicioszamlalo pontosan a vart merteket valtozott - a SZOFTVER oldal jonak tunik, a hiba nagy valoszinuseggel HARDVER szinten van (STEP-jel, driver, tekercs, tap).", item.motorIndex);
+  }
 }
 
 void executeMagnetTest(const QueueItem &item) {
@@ -733,16 +788,26 @@ void setup() {
 
   engine.init();
   motorA = engine.stepperConnectToPin(STEP_A_PIN);
-  motorA->setDirectionPin(DIR_A_PIN);
-  motorA->setAutoEnable(false);
   motorB = engine.stepperConnectToPin(STEP_B_PIN);
-  motorB->setDirectionPin(DIR_B_PIN);
-  motorB->setAutoEnable(false);
+
+  // Diagnosztika: azonnal lássuk soros/web-logon, ha az engine nem tudta
+  // csatlakoztatni valamelyik pint (pl. pin-ütközés vagy hardvertimer hiány).
+  if (!motorA) Serial.println("FIGYELEM: motorA (STEP_A_PIN=25) csatlakoztatasa sikertelen!");
+  if (!motorB) Serial.println("FIGYELEM: motorB (STEP_B_PIN=27) csatlakoztatasa sikertelen!");
+
+  if (motorA) {
+    motorA->setDirectionPin(DIR_A_PIN);
+    motorA->setAutoEnable(false);
+  }
+  if (motorB) {
+    motorB->setDirectionPin(DIR_B_PIN);
+    motorB->setAutoEnable(false);
+  }
 
   float lenA, lenB;
   computeStringLengths(currentX, currentY, lenA, lenB);
-  motorA->setCurrentPosition(mmToSteps(lenA));
-  motorB->setCurrentPosition(mmToSteps(lenB));
+  if (motorA) motorA->setCurrentPosition(mmToSteps(lenA));
+  if (motorB) motorB->setCurrentPosition(mmToSteps(lenB));
 
   Serial.println("Pick-and-place polargraph keszul (queue-alapu mozgatas, IBT-2 PWM magnes).");
 
@@ -756,6 +821,10 @@ void setup() {
   } else {
     webLog("mDNS inditasa sikertelen.");
   }
+
+  // Motor-diagnosztika a webLog-ba is, hogy /log-on tavolrol is lathato legyen.
+  webLogf("Motor diagnosztika: motorA=%s, motorB=%s, ENABLE_PIN(13)=%d",
+          motorA ? "OK" : "NULL", motorB ? "OK" : "NULL", digitalRead(ENABLE_PIN));
 
   // ---- Webszerver ----
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
