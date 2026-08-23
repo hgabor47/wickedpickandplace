@@ -47,7 +47,7 @@ const int BTN1 = 0, BTN2 = 1, BTN3 = 2, BTN4 = 3, BTN5 = 4, BTN6 = 5, BTN7 = 6, 
 
 // ============ PLAY / EDIT MOD ============
 enum AppMode : uint8_t { MODE_PLAY = 0, MODE_EDIT = 1 };
-enum EditSubMode : uint8_t { EDIT_MENU = 0, EDIT_SETUP = 1, EDIT_ORIGIN = 2, EDIT_MOVE = 3, EDIT_CELLS = 4, EDIT_PATH = 5 };
+enum EditSubMode : uint8_t { EDIT_MENU = 0, EDIT_SETUP = 1, EDIT_MOVE = 3, EDIT_CELLS = 4, EDIT_PATH = 5 };
 AppMode appMode = MODE_PLAY;
 EditSubMode editSubMode = EDIT_MENU;
 
@@ -611,7 +611,7 @@ void handleDigit(char digit) {
 //  A-horgony) es motorB ("RIGHT", B-horgony) nyers lepesszamai alapjan,
 //  a SETUP-ban rogzitett 4 sarokpontbol bilinearis interpolacioval
 //  szamolva - igy nem kell megbizni a hardkodolt ANCHOR_A/B / STEPS_PER_MM
-//  allandokban, azokat a SETUP+ORIGIN kalibracio valtja ki.
+//  allandokban, azokat a SETUP kalibracio valtja ki.
 // =====================================================================
 #define GRID_COLS        7
 #define GRID_ROWS        5
@@ -626,7 +626,51 @@ long gridCellA[GRID_CELL_COUNT] = {0};
 long gridCellB[GRID_CELL_COUNT] = {0};
 bool gridCellsComputed = false;
 
+// A 4 sarok VALODI (X,Y) helye (trilateracioval szamolva a sarkok mert
+// kotelhosszaibol) - ez kell ahhoz, hogy a soron kovetkezo interpolacio a
+// valos sikban legyen linearis (egyenes vonalu), ne a kotelhossz-terben
+// (ami ivet adna, lasd lejjebb gridTargetForUV).
+float gridCornerX[4] = {0}, gridCornerY[4] = {0};
+bool gridCornerXYValid = false;
+
 float moveU = 0.5f, moveV = 0.5f; // MOVE/CELLS almod aktualis normalizalt (0..1) pozicioja
+
+// ---- M3-C: auto-kalibracio (legkisebb negyzetek) allapota ----
+// A felhasznalo lemeri a valos munkaterulet meretet ("setArea" parancs),
+// a SETUP pedig pontosan a 4 sarokra all - ebbol Gauss-Newton iteracioval
+// visszaszamoljuk a 2 horgony VALODI (X,Y) helyet + egy step->mm eltolast
+// horgonyonkent (calOffA/B), igy nem kell a horgonyt fizikailag lemerni.
+// Amig nincs ervenyes auto-kalibracio (calValid==false), a rendszer a
+// regi, hardkodolt ANCHOR_A/B allandokra esik vissza (0 eltolassal).
+float workAreaXMax = 0, workAreaYMax = 0;
+float calAx = ANCHOR_A_X, calAy = ANCHOR_A_Y;
+float calBx = ANCHOR_B_X, calBy = ANCHOR_B_Y;
+float calOffAmm = 0, calOffBmm = 0;
+bool calValid = false;
+
+void saveCalibration() {
+  prefs.putFloat("calAx", calAx);
+  prefs.putFloat("calAy", calAy);
+  prefs.putFloat("calBx", calBx);
+  prefs.putFloat("calBy", calBy);
+  prefs.putFloat("calOffA", calOffAmm);
+  prefs.putFloat("calOffB", calOffBmm);
+  prefs.putUChar("calValid", calValid ? 1 : 0);
+  prefs.putFloat("areaXMax", workAreaXMax);
+  prefs.putFloat("areaYMax", workAreaYMax);
+}
+
+void loadCalibration() {
+  calAx = prefs.getFloat("calAx", ANCHOR_A_X);
+  calAy = prefs.getFloat("calAy", ANCHOR_A_Y);
+  calBx = prefs.getFloat("calBx", ANCHOR_B_X);
+  calBy = prefs.getFloat("calBy", ANCHOR_B_Y);
+  calOffAmm = prefs.getFloat("calOffA", 0);
+  calOffBmm = prefs.getFloat("calOffB", 0);
+  calValid = prefs.getUChar("calValid", 0) != 0;
+  workAreaXMax = prefs.getFloat("areaXMax", 0);
+  workAreaYMax = prefs.getFloat("areaYMax", 0);
+}
 
 void saveGridCorners() {
   prefs.putBytes("gridCornA", gridCornerA, sizeof(gridCornerA));
@@ -658,10 +702,310 @@ long bilerpLong(long v00, long v10, long v01, long v11, float u, float v) {
   return (long)round(top + (bot - top) * v);
 }
 
+float bilerpFloat(float v00, float v10, float v01, float v11, float u, float v) {
+  float top = v00 + (v10 - v00) * u;
+  float bot = v01 + (v11 - v01) * u;
+  return top + (bot - top) * v;
+}
+
+// Ket kor (ax,ay es bx,by kozeppontal, lenA/lenB sugarral) metszespontjabol
+// azt az (X,Y)-t adja vissza, amelyik a horgonyok "alatt" van (nagyobb Y).
+// Altalanos valtozat (nem hardkodolt ANCHOR_A/B-re), mert a kalibralt
+// horgonypoziciok (calAx/calAy/calBx/calBy) is ugyanezt hasznaljak.
+bool circleIntersectBelow(float ax, float ay, float bx, float by,
+                           float lenA, float lenB, float &outX, float &outY) {
+  float dx = bx - ax, dy = by - ay;
+  float d2 = dx * dx + dy * dy;
+  float d = sqrt(d2);
+  if (d < 1e-3f) return false;
+  float a = (lenA * lenA - lenB * lenB + d2) / (2.0f * d);
+  float h2 = lenA * lenA - a * a;
+  // Kis negativ h2 meg mert-hiba miatti numerikus zaj lehet (0-nak vesszuk),
+  // de ha tul negativ, a ket kor egyaltalan nem metszi egymast - HIBA (M4).
+  if (h2 < -1.0f) return false;
+  float h = (h2 > 0) ? sqrt(h2) : 0.0f;
+  float px = ax + a * dx / d, py = ay + a * dy / d;
+  float rx = -dy / d, ry = dx / d; // egysegnyi merolegesvektor az AB egyenesre
+  float x1 = px + h * rx, y1 = py + h * ry;
+  float x2 = px - h * rx, y2 = py - h * ry;
+  if (y1 >= y2) { outX = x1; outY = y1; } else { outX = x2; outY = y2; }
+  return true;
+}
+
+// step-parbol (motorA/motorB nyers pozicio) valodi (X,Y)-t szamol - a
+// kalibralt horgonypoziciokat/eltolasokat hasznalja, ha van ervenyes
+// auto-kalibracio (calValid), kulonben a regi hardkodolt ANCHOR_A/B-re
+// esik vissza (0 eltolassal) - ez az EGYETLEN hely, ahol step->(X,Y)
+// tortenik az EDIT-mod racs-rendszereben (M1: egyetlen igazsagforras).
+bool trilaterateSteps(long stepsA, long stepsB, float &outX, float &outY) {
+  float ax = calValid ? calAx : (float)ANCHOR_A_X;
+  float ay = calValid ? calAy : (float)ANCHOR_A_Y;
+  float bx = calValid ? calBx : (float)ANCHOR_B_X;
+  float by = calValid ? calBy : (float)ANCHOR_B_Y;
+  float lenA = stepsA / STEPS_PER_MM + (calValid ? calOffAmm : 0.0f);
+  float lenB = stepsB / STEPS_PER_MM + (calValid ? calOffBmm : 0.0f);
+  return circleIntersectBelow(ax, ay, bx, by, lenA, lenB, outX, outY);
+}
+
+// (X,Y) -> step-par, a trilaterateSteps() inverze - ugyanazokat a kalibralt
+// horgonypoziciokat/eltolasokat hasznalja, mint trilaterateSteps().
+void xyToSteps(float x, float y, long &outA, long &outB) {
+  float ax = calValid ? calAx : (float)ANCHOR_A_X;
+  float ay = calValid ? calAy : (float)ANCHOR_A_Y;
+  float bx = calValid ? calBx : (float)ANCHOR_B_X;
+  float by = calValid ? calBy : (float)ANCHOR_B_Y;
+  float offA = calValid ? calOffAmm : 0.0f;
+  float offB = calValid ? calOffBmm : 0.0f;
+  float lenA = sqrt(sq(x - ax) + sq(y - ay));
+  float lenB = sqrt(sq(x - bx) + sq(y - by));
+  outA = mmToSteps(lenA - offA);
+  outB = mmToSteps(lenB - offB);
+}
+
+// M4: ellenorzi, hogy a 4 szamolt sarok (X,Y) egy ertelmes, konvex
+// negyszoget alkot-e (a kerulet menten 0->1->3->2 sorrendben, mert a
+// sarokindexek: 0=(0,0) 1=(0,YMAX) 2=(XMAX,0) 3=(XMAX,YMAX)). Ha nem
+// (elfajult vagy "atcsavarodott" negyszog), a kalibracio hasznalhatatlan.
+bool cornersFormReasonableRect() {
+  int order[4] = {0, 1, 3, 2};
+  float refSign = 0;
+  double area2 = 0;
+  for (int k = 0; k < 4; k++) {
+    int i0 = order[k], i1 = order[(k + 1) % 4], i2 = order[(k + 2) % 4];
+    float ex = gridCornerX[i1] - gridCornerX[i0], ey = gridCornerY[i1] - gridCornerY[i0];
+    float fx = gridCornerX[i2] - gridCornerX[i1], fy = gridCornerY[i2] - gridCornerY[i1];
+    float cross = ex * fy - ey * fx;
+    float s = (cross > 0) ? 1.0f : -1.0f;
+    if (k == 0) refSign = s;
+    else if (s != refSign) return false; // nem konvex / atcsavarodott
+    area2 += (double)gridCornerX[i0] * gridCornerY[i1] - (double)gridCornerX[i1] * gridCornerY[i0];
+  }
+  return fabs(area2) > 100.0; // legalabb nehany cm^2 terulet, ne fajuljon el
+}
+
+// Ujraszamolja a 4 sarok valos (X,Y) helyet a mert kotelhosszakbol - hivd
+// meg mindig, amikor gridCornerA/B (vagy a kalibracio) valtozik (4. sarok
+// tarolasakor, auto-kalibracio utan, illetve boot-kor a betoltes utan).
+void computeGridCornerXY() {
+  if (gridCornerMask != 0x0F) { gridCornerXYValid = false; return; }
+  gridCornerXYValid = true;
+  for (int i = 0; i < 4; i++) {
+    if (!trilaterateSteps(gridCornerA[i], gridCornerB[i], gridCornerX[i], gridCornerY[i])) gridCornerXYValid = false;
+  }
+  if (gridCornerXYValid && !cornersFormReasonableRect()) {
+    gridCornerXYValid = false;
+    webLog("SETUP: HIBA - a szamitott sarok-negyszog ertelmetlen (nem konvex vagy elfajult). Ellenorizd a SETUP sarkokat / futtass setArea-t.");
+  }
+}
+
 // u: 0=X-min .. 1=X-max oldal, v: 0=Y-min .. 1=Y-max oldal
+// A cel (X,Y)-t a sarkok VALOS (nem kotelhossz-terbeli) koordinatai kozott
+// interpolaljuk linearisan, majd abbol szamoljuk a lepesszamokat
+// (xyToSteps) - igy a jog egyenes vonalat ir le, nem ivet.
 void gridTargetForUV(float u, float v, long &outA, long &outB) {
-  outA = bilerpLong(gridCornerA[0], gridCornerA[2], gridCornerA[1], gridCornerA[3], u, v);
-  outB = bilerpLong(gridCornerB[0], gridCornerB[2], gridCornerB[1], gridCornerB[3], u, v);
+  if (!gridCornerXYValid) {
+    // biztonsagi tartalek, ha meg nincs kesz mind a 4 sarok (elvileg ide nem
+    // szabadna eljutni, mert az EDIT_MOVE/CELLS csak teljes SETUP utan ertelmes).
+    outA = bilerpLong(gridCornerA[0], gridCornerA[2], gridCornerA[1], gridCornerA[3], u, v);
+    outB = bilerpLong(gridCornerB[0], gridCornerB[2], gridCornerB[1], gridCornerB[3], u, v);
+    return;
+  }
+  float x = bilerpFloat(gridCornerX[0], gridCornerX[2], gridCornerX[1], gridCornerX[3], u, v);
+  float y = bilerpFloat(gridCornerY[0], gridCornerY[2], gridCornerY[1], gridCornerY[3], u, v);
+  xyToSteps(x, y, outA, outB);
+}
+
+// step-par -> (u,v), a gridTargetForUV() inverze (M1: single source of
+// truth - ebbol frissul moveU/moveV a TENYLEGES motorpoziciobol, sose egy
+// szabadon "szamolt" belso valtozobol). Mivel a sarkok (X,Y) alapjan
+// bilinearisan interpolalunk, az inverz egy 2D nemlinearis egyenletrendszer
+// - ezt egy rovid, veges-differencia Newton-iteracioval oldjuk meg (a
+// fuggveny sima es jol viselkedik, 8 iteracio bven eleg a kivant <0.1mm
+// pontossaghoz).
+bool gridUVForSteps(long stepsA, long stepsB, float &outU, float &outV) {
+  if (!gridCornerXYValid) return false;
+  float x, y;
+  if (!trilaterateSteps(stepsA, stepsB, x, y)) return false;
+
+  float u = moveU, v = moveV; // jo kezdobecsles: az utoljara ismert (u,v)
+  const float h = 0.001f;
+  for (int iter = 0; iter < 8; iter++) {
+    float fx = bilerpFloat(gridCornerX[0], gridCornerX[2], gridCornerX[1], gridCornerX[3], u, v) - x;
+    float fy = bilerpFloat(gridCornerY[0], gridCornerY[2], gridCornerY[1], gridCornerY[3], u, v) - y;
+    if (fabs(fx) < 0.05f && fabs(fy) < 0.05f) break; // 0.05mm-en belul mar eleg jo
+    float fxu = (bilerpFloat(gridCornerX[0], gridCornerX[2], gridCornerX[1], gridCornerX[3], u + h, v) - x - fx) / h;
+    float fyu = (bilerpFloat(gridCornerY[0], gridCornerY[2], gridCornerY[1], gridCornerY[3], u + h, v) - y - fy) / h;
+    float fxv = (bilerpFloat(gridCornerX[0], gridCornerX[2], gridCornerX[1], gridCornerX[3], u, v + h) - x - fx) / h;
+    float fyv = (bilerpFloat(gridCornerY[0], gridCornerY[2], gridCornerY[1], gridCornerY[3], u, v + h) - y - fy) / h;
+    float det = fxu * fyv - fxv * fyu;
+    if (fabs(det) < 1e-6f) break;
+    float du = (fyv * fx - fxv * fy) / det;
+    float dv = (fxu * fy - fyu * fx) / det;
+    u -= du; v -= dv;
+    u = constrain(u, -0.5f, 1.5f);
+    v = constrain(v, -0.5f, 1.5f);
+  }
+  outU = constrain(u, 0.0f, 1.0f);
+  outV = constrain(v, 0.0f, 1.0f);
+  return true;
+}
+
+// A motorok TENYLEGES step-poziciojabol frissiti a szarmaztatott EDIT-mod
+// allapotot (moveU/moveV) - ez az egyetlen hely, ahol ezek a valtozok
+// ervenyes erteket kapnak nyers jog (SETUP), sarok-mentes vagy
+// (ujra)kalibracio utan (M1: igy moveU/moveV sose fut el a valositol).
+void syncStateFromMotors() {
+  if (!motorA || !motorB || !gridCornerXYValid) return;
+  long a = motorA->getCurrentPosition();
+  long b = motorB->getCurrentPosition();
+  float u, v;
+  if (gridUVForSteps(a, b, u, v)) {
+    moveU = u; moveV = v;
+  }
+}
+
+// ---- M3-C: 6x6 linearis egyenletrendszer megoldasa Gauss-eliminacioval
+// (reszleges pivotalassal) - a Gauss-Newton legkisebb negyzetek lepeséhez. ----
+bool solveLinear6(double A[6][6], double *b, double *x) {
+  double M[6][7];
+  for (int i = 0; i < 6; i++) {
+    for (int j = 0; j < 6; j++) M[i][j] = A[i][j];
+    M[i][6] = b[i];
+  }
+  for (int col = 0; col < 6; col++) {
+    int piv = col;
+    double best = fabs(M[col][col]);
+    for (int r = col + 1; r < 6; r++) {
+      if (fabs(M[r][col]) > best) { best = fabs(M[r][col]); piv = r; }
+    }
+    if (best < 1e-9) return false;
+    if (piv != col) {
+      for (int c = 0; c <= 6; c++) {
+        double tmp = M[col][c]; M[col][c] = M[piv][c]; M[piv][c] = tmp;
+      }
+    }
+    for (int r = 0; r < 6; r++) {
+      if (r == col) continue;
+      double f = M[r][col] / M[col][col];
+      for (int c = col; c <= 6; c++) M[r][c] -= f * M[col][c];
+    }
+  }
+  for (int i = 0; i < 6; i++) x[i] = M[i][6] / M[i][i];
+  return true;
+}
+
+// Auto-kalibracio (M3, "C" valtozat): a 4 SETUP-sarok mert lepesszamaibol
+// es a felhasznalo altal megadott valos munkaterulet-meretbol (workAreaXMax/
+// YMax, lasd "setArea" parancs) Levenberg-Marquardt legkisebb negyzetekkel
+// visszaszamolja a 2 horgony VALODI (X,Y) helyet + egy step->mm eltolast
+// horgonyonkent (6 ismeretlen: ax,ay,bx,by,offA,offB; 8 egyenlet: 4 sarok x
+// 2 horgony-tavolsag). Numerikus (veges differencia) Jacobi-matrixot hasznal.
+// A "sima" Gauss-Newton (damping nelkul) egy rossz kezdeti becslesnel (pl. a
+// hardkodolt ANCHOR_A/B nagyon tavol van a valos horgonytol) konnyen
+// szingularis normalegyenletekhez / divergenciahoz vezetett - LM-damping-gel
+// ez robusztus marad, es minden sikertelen esetben logol, hogy miert.
+bool runAutoCalibration() {
+  if (gridCornerMask != 0x0F || workAreaXMax <= 0 || workAreaYMax <= 0) return false;
+
+  // sarokindex: 0=(0,0) 1=(0,YMAX) 2=(XMAX,0) 3=(XMAX,YMAX)
+  float cornerRealX[4] = {0, 0, workAreaXMax, workAreaXMax};
+  float cornerRealY[4] = {0, workAreaYMax, 0, workAreaYMax};
+
+  // Kezdeti becsles: a hardkodolt ANCHOR_A/B alakja/aranya, de a munkaterulet
+  // kozepere igazitva (X-ben), hogy koveto legyen a valos meretekhez - ez
+  // sokkal jobb induloertek, mint a nyers ANCHOR_A/B konstansok, ha a
+  // munkaterulet merete tavol esik azoktol.
+  double p[6] = { -workAreaXMax * 0.15, -workAreaYMax * 0.15,
+                  workAreaXMax * 1.15,  -workAreaYMax * 0.15,
+                  0.0, 0.0 };
+
+  auto residuals = [&](double *pp, double *r) {
+    for (int i = 0; i < 4; i++) {
+      double lenA = gridCornerA[i] / (double)STEPS_PER_MM + pp[4];
+      double lenB = gridCornerB[i] / (double)STEPS_PER_MM + pp[5];
+      double dA = sqrt(sq(cornerRealX[i] - pp[0]) + sq(cornerRealY[i] - pp[1])) - lenA;
+      double dB = sqrt(sq(cornerRealX[i] - pp[2]) + sq(cornerRealY[i] - pp[3])) - lenB;
+      r[i * 2 + 0] = dA;
+      r[i * 2 + 1] = dB;
+    }
+  };
+  auto costOf = [](double *r) {
+    double s = 0;
+    for (int i = 0; i < 8; i++) s += r[i] * r[i];
+    return s;
+  };
+
+  double r0[8], rP[8], rTrial[8];
+  residuals(p, r0);
+  double bestCost = costOf(r0);
+  double lambda = 1e-3;
+  int iter;
+  for (iter = 0; iter < 60; iter++) {
+    residuals(p, r0);
+    double J[8][6];
+    for (int k = 0; k < 6; k++) {
+      double saved = p[k];
+      double h = (k < 4) ? 0.5 : 0.1; // mm-lepes a numerikus derivalthoz
+      p[k] = saved + h;
+      residuals(p, rP);
+      p[k] = saved;
+      for (int i = 0; i < 8; i++) J[i][k] = (rP[i] - r0[i]) / h;
+    }
+    double JTJ[6][6] = {{0}};
+    double JTr[6] = {0};
+    for (int a = 0; a < 6; a++) {
+      for (int b = 0; b < 6; b++) {
+        double s = 0;
+        for (int i = 0; i < 8; i++) s += J[i][a] * J[i][b];
+        JTJ[a][b] = s;
+      }
+      double s = 0;
+      for (int i = 0; i < 8; i++) s += J[i][a] * r0[i];
+      JTr[a] = -s;
+    }
+    // LM-damping: a fodiagonalist (1+lambda)-szorosara novelve mindig
+    // szabalyos (nem szingularis) marad a normalegyenlet-rendszer.
+    double JTJd[6][6];
+    for (int a = 0; a < 6; a++) {
+      for (int b = 0; b < 6; b++) JTJd[a][b] = JTJ[a][b];
+      JTJd[a][a] = JTJ[a][a] * (1.0 + lambda) + 1e-9;
+    }
+    double dp[6] = {0};
+    if (!solveLinear6(JTJd, JTr, dp)) {
+      lambda *= 10.0;
+      if (lambda > 1e8) { webLog("AUTOKAL: HIBA - a normalegyenlet szingularis marad, feladva."); return false; }
+      continue;
+    }
+    double pTrial[6];
+    for (int k = 0; k < 6; k++) pTrial[k] = p[k] + dp[k];
+    residuals(pTrial, rTrial);
+    double trialCost = costOf(rTrial);
+    if (trialCost < bestCost) {
+      for (int k = 0; k < 6; k++) p[k] = pTrial[k];
+      bool converged = (bestCost - trialCost) < 1e-6 * (bestCost + 1e-9);
+      bestCost = trialCost;
+      lambda = max(lambda * 0.3, 1e-8);
+      if (converged) { iter++; break; }
+    } else {
+      lambda *= 4.0;
+      if (lambda > 1e8) { webLog("AUTOKAL: HIBA - nem sikerult javitani a hibat, feladva."); return false; }
+    }
+  }
+
+  residuals(p, r0);
+  double rmsErrorMm = sqrt(costOf(r0) / 8.0);
+  webLogf("AUTOKAL: %d iteracio, RMS hiba = %.2f mm (A=%.1f,%.1f B=%.1f,%.1f offA=%.2f offB=%.2f)",
+          iter, rmsErrorMm, p[0], p[1], p[2], p[3], p[4], p[5]);
+  if (rmsErrorMm > 5.0) {
+    webLog("AUTOKAL: HIBA - a maradek hiba tul nagy (>5mm), a kalibracio elutasitva.");
+    return false;
+  }
+  calAx = (float)p[0]; calAy = (float)p[1];
+  calBx = (float)p[2]; calBy = (float)p[3];
+  calOffAmm = (float)p[4]; calOffBmm = (float)p[5];
+  calValid = true;
+  saveCalibration();
+  return true;
 }
 
 void computeDefaultGridCells() {
@@ -694,7 +1038,7 @@ void ackPulse(FastAccelStepper *mot, int times) {
 void ackLeft(int times)  { ackPulse(motorA, times); }  // motorA = A-horgony ("LEFT")
 void ackRight(int times) { ackPulse(motorB, times); }  // motorB = B-horgony ("RIGHT")
 
-// ============ NYERS MOTOR-JOG (SETUP/ORIGIN): nyomva tartas alatt folyamatos ============
+// ============ NYERS MOTOR-JOG (SETUP): nyomva tartas alatt folyamatos ============
 const float JOG_SPEED_MM_S  = 80.0;
 const float JOG_ACCEL_MM_S2 = 500.0;
 
@@ -708,12 +1052,22 @@ void jogMotorStop(FastAccelStepper *mot) {
 }
 
 // ============ MOVE/CELLS JOG: kalibralt racs-terben, normalizalt (u,v) ============
-void moveJogApply() {
-  if (gridCornerMask != 0x0F) return;
+// M2: mindket motor a SAJAT delta-javal aranyos sebesseget kap (nem egyforma
+// maximum sebesseget), igy egy szerre erkeznek a celba - ez adja az egyenes
+// vonalu, nem "foghijas" mozgast (H4 javitasa).
+void moveJogApply(float u, float v) {
+  if (gridCornerMask != 0x0F || !motorA || !motorB) return;
   long ta, tb;
-  gridTargetForUV(moveU, moveV, ta, tb);
-  motorA->setSpeedInHz(mmSpeedToStepsHz(JOG_SPEED_MM_S));
-  motorB->setSpeedInHz(mmSpeedToStepsHz(JOG_SPEED_MM_S));
+  gridTargetForUV(u, v, ta, tb);
+  long curA = motorA->getCurrentPosition(), curB = motorB->getCurrentPosition();
+  long dA = abs(ta - curA), dB = abs(tb - curB);
+  long dMax = max(dA, dB);
+  if (dMax == 0) return;
+  uint32_t vMax = mmSpeedToStepsHz(JOG_SPEED_MM_S);
+  uint32_t speedA = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dA) / (uint64_t)dMax));
+  uint32_t speedB = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dB) / (uint64_t)dMax));
+  motorA->setSpeedInHz(speedA);
+  motorB->setSpeedInHz(speedB);
   motorA->setAcceleration(mmAccelToStepsS2(JOG_ACCEL_MM_S2));
   motorB->setAcceleration(mmAccelToStepsS2(JOG_ACCEL_MM_S2));
   motorA->moveTo(ta);
@@ -721,19 +1075,19 @@ void moveJogApply() {
 }
 
 // A loop()-bol minden ciklusban hivva - amig LEFT/RIGHT/UP/DOWN nyomva van,
-// folyamatosan (de valos ido szerint mert, nem tick-szamtol fuggoen) kozeliti
-// a celt a kalibralt racs-terben; elengedeskor azonnal megallitja a motort,
-// nehogy egy korabban kiadott tavoli moveTo()-cel fele tovabb fusson.
-const float JOG_RATE_PER_SEC = 0.15f; // a 0..1 racs-tartomany ennyi resze/mp
+// periodikusan (JOG_REPLAN_MS-enkent) ujratervezi a celt, MINDIG a motorok
+// TENYLEGES aktualis poziciojabol kiindulva (gridUVForSteps - M1/H5 javitas,
+// nem egy szabadon "elszaladhato" belso u/v valtozobol), egy rovid
+// "lookahead"-del a nyomott irany(ok)ba. Elengedeskor azonnal megallitja a
+// motort es szinkronizalja az allapotot a tenyleges pozicioval.
+const float JOG_LOOKAHEAD = 0.05f; // a 0..1 racs-tartomany ennyi resze / ujratervezes
+const unsigned long JOG_REPLAN_MS = 30;
 void updateMoveJogTick() {
   if (appMode != MODE_EDIT) return;
   if (editSubMode != EDIT_MOVE && editSubMode != EDIT_CELLS) return;
 
-  static unsigned long lastTickMs = 0;
+  static unsigned long lastReplanMs = 0;
   static bool jogWasActive = false;
-  unsigned long now = millis();
-  float dt = (lastTickMs == 0) ? 0.0f : (now - lastTickMs) / 1000.0f;
-  lastTickMs = now;
 
   bool anyHeld = (stableState[BTN8] == LOW) || (stableState[BTN2] == LOW) ||
                  (stableState[BTN4] == LOW) || (stableState[BTN5] == LOW);
@@ -742,19 +1096,28 @@ void updateMoveJogTick() {
       motorA->stopMove();
       motorB->stopMove();
       jogWasActive = false;
+      syncStateFromMotors();
     }
     return;
   }
+
+  unsigned long now = millis();
+  if (jogWasActive && (now - lastReplanMs) < JOG_REPLAN_MS) return; // meg ne tervezzunk ujra
+  lastReplanMs = now;
   jogWasActive = true;
 
-  float delta = JOG_RATE_PER_SEC * dt;
-  if (stableState[BTN8] == LOW) moveU -= delta; // LEFT
-  if (stableState[BTN2] == LOW) moveU += delta; // RIGHT
-  if (stableState[BTN4] == LOW) moveV -= delta; // UP
-  if (stableState[BTN5] == LOW) moveV += delta; // DOWN
-  moveU = constrain(moveU, 0.0f, 1.0f);
-  moveV = constrain(moveV, 0.0f, 1.0f);
-  moveJogApply();
+  float curU, curV;
+  if (!gridUVForSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), curU, curV)) return;
+
+  float tgtU = curU, tgtV = curV;
+  if (stableState[BTN8] == LOW) tgtU -= JOG_LOOKAHEAD; // LEFT
+  if (stableState[BTN2] == LOW) tgtU += JOG_LOOKAHEAD; // RIGHT
+  if (stableState[BTN4] == LOW) tgtV -= JOG_LOOKAHEAD; // UP
+  if (stableState[BTN5] == LOW) tgtV += JOG_LOOKAHEAD; // DOWN
+  tgtU = constrain(tgtU, 0.0f, 1.0f);
+  tgtV = constrain(tgtV, 0.0f, 1.0f);
+  moveU = tgtU; moveV = tgtV; // tajekoztato allapot (pl. MOVE ENTER log-jahoz)
+  moveJogApply(tgtU, tgtV);
 }
 
 // Az EDIT menu SETUP-belepes (3-as gomb 1x) fuggoben tartasat zarja le, ha
@@ -787,8 +1150,25 @@ void storeCorner(int cornerIdx, const char *label) {
   webLogf("SETUP: sarok '%s' tarolva (A=%ld, B=%ld)", label, gridCornerA[cornerIdx], gridCornerB[cornerIdx]);
   ackRight(1);
   if (gridCornerMask == 0x0F) {
+    // M3-C: ha mar ismert a valos munkaterulet merete (setArea parancs),
+    // most probaljuk auto-kalibralni a horgonyokat legkisebb negyzetekkel.
+    if (workAreaXMax > 0 && workAreaYMax > 0) {
+      if (!runAutoCalibration()) {
+        webLog("SETUP: AUTOKAL sikertelen - a regi, nem kalibralt horgonybecslest hasznaljuk (lasd fenti log).");
+      }
+    } else {
+      webLog("SETUP: nincs meg 'setArea' parancs kiadva - AUTOKAL kimarad, kesobb (setArea utan) is lefuthat.");
+    }
+    computeGridCornerXY();
     computeDefaultGridCells();
-    webLog("SETUP: mind a 4 sarok megvan - cellaracs (ujra)szamolva.");
+    syncStateFromMotors();
+    if (gridCornerXYValid) {
+      webLogf("SETUP: mind a 4 sarok megvan - cellaracs (ujra)szamolva. Sarkok (X,Y) mm: (0,0)=(%.1f,%.1f) (0,YMAX)=(%.1f,%.1f) (XMAX,0)=(%.1f,%.1f) (XMAX,YMAX)=(%.1f,%.1f)",
+              gridCornerX[0], gridCornerY[0], gridCornerX[1], gridCornerY[1],
+              gridCornerX[2], gridCornerY[2], gridCornerX[3], gridCornerY[3]);
+    } else {
+      webLog("SETUP: FIGYELEM - a sarok-geometria ervenytelen (lasd fenti hibauzenet), MOVE/CELLS nem lesz elerheto.");
+    }
   }
 }
 
@@ -809,39 +1189,8 @@ void setupHandlePress(int i) {
 
 void setupHandleRelease(int i) {
   switch (i) {
-    case BTN5: case BTN8: jogMotorStop(motorA); break;
-    case BTN2: case BTN4: jogMotorStop(motorB); break;
-    default: break;
-  }
-}
-
-// ============ EDIT ALMOD: ORIGIN ============
-void originConfirm() {
-  if (gridCornerMask != 0x0F) {
-    webLog("ORIGIN: HIBA - a SETUP meg nincs kesz (nincs mind a 4 sarok elmentve).");
-    return;
-  }
-  motorA->setCurrentPosition(gridCornerA[0]);
-  motorB->setCurrentPosition(gridCornerB[0]);
-  webLogf("ORIGIN: kalibralva a (0,0) sarokhoz (A=%ld, B=%ld).", gridCornerA[0], gridCornerB[0]);
-  ackRight(2);
-}
-
-void originHandlePress(int i) {
-  switch (i) {
-    case BTN1: originConfirm(); break;
-    case BTN5: jogMotorStart(motorA, -1); break;
-    case BTN8: jogMotorStart(motorA, +1); break;
-    case BTN2: jogMotorStart(motorB, -1); break;
-    case BTN4: jogMotorStart(motorB, +1); break;
-    default: break;
-  }
-}
-
-void originHandleRelease(int i) {
-  switch (i) {
-    case BTN5: case BTN8: jogMotorStop(motorA); break;
-    case BTN2: case BTN4: jogMotorStop(motorB); break;
+    case BTN5: case BTN8: jogMotorStop(motorA); syncStateFromMotors(); break;
+    case BTN2: case BTN4: jogMotorStop(motorB); syncStateFromMotors(); break;
     default: break;
   }
 }
@@ -896,10 +1245,18 @@ void cellsHandleRelease(int i) {
 }
 
 // ============ EDIT FOMENU + MOD-VALTAS ============
+// M4: MOVE/CELLS csak ervenyes racs-kalibracioval erheto el (gridCornerXYValid) -
+// kulonben nem lepunk be, csak logolunk es hangjelzes/ack nelkul visszaterunk,
+// hogy ne lehessen ervenytelen geometrian jogolni. PATH nem igenyli.
 void enterEditSubMode(EditSubMode m, const char *name) {
+  if ((m == EDIT_MOVE || m == EDIT_CELLS) && !gridCornerXYValid) {
+    webLogf("EDIT: '%s' almod elutasitva - nincs ervenyes racs-kalibracio (fejezd be a SETUP-ot / futtasd le a setArea-t).", name);
+    return;
+  }
   editSubMode = m;
   webLogf("EDIT almod: %s", name);
   ackRight(2);
+  syncStateFromMotors(); // M1: moveU/moveV frissul a tenyleges motorpoziciobol
 }
 
 void onButtonPressed(int i) {
@@ -927,6 +1284,16 @@ void onButtonPressed(int i) {
     if (i == BTN3) {
       if (tapCount[BTN3] == 8) {
         pendingSetupEntry = false;
+        // H2 (reszleges javitas): a PLAY mod sajat, regi ANCHOR_A/B-alapu
+        // kinematikat hasznal (valtozatlan), de legalabb a "hol vagyunk"
+        // becslest frissitjuk a legjobb ismert (kalibralt) adatbol, hogy ne
+        // maradjon egy teljesen stale (boot-kori) ertek.
+        if (gridCornerXYValid && motorA && motorB) {
+          float x, y;
+          if (trilaterateSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), x, y)) {
+            currentX = x; currentY = y;
+          }
+        }
         appMode = MODE_PLAY;
         tapCount[BTN3] = 0;
         webLog("PLAY mod aktivalva (gomb3 x8).");
@@ -942,7 +1309,6 @@ void onButtonPressed(int i) {
     switch (i) {
       case BTN1: enterEditSubMode(EDIT_PATH,   "PATH");   break;
       case BTN2: enterEditSubMode(EDIT_CELLS,  "CELLS");  break;
-      case BTN5: enterEditSubMode(EDIT_ORIGIN, "ORIGIN"); break;
       case BTN8: enterEditSubMode(EDIT_MOVE,   "MOVE");   break;
       default: break;
     }
@@ -969,7 +1335,6 @@ void onButtonPressed(int i) {
 
   switch (editSubMode) {
     case EDIT_SETUP:  setupHandlePress(i);  break;
-    case EDIT_ORIGIN: originHandlePress(i); break;
     case EDIT_MOVE:   moveHandlePress(i);   break;
     case EDIT_CELLS:  cellsHandlePress(i);  break;
     case EDIT_PATH:   break; // meg nincs kifejtve - csak a belepes logolodik
@@ -981,7 +1346,6 @@ void onButtonReleased(int i) {
   if (appMode != MODE_EDIT) return;
   switch (editSubMode) {
     case EDIT_SETUP:  setupHandleRelease(i);  break;
-    case EDIT_ORIGIN: originHandleRelease(i); break;
     case EDIT_MOVE:   moveHandleRelease(i);   break;
     case EDIT_CELLS:  cellsHandleRelease(i);  break;
     default: break;
@@ -1146,6 +1510,58 @@ String cmdClearCells() {
   return "OK: minden cella torolve, formatum ujrainicializalva (v" + String(CELL_FORMAT_VERSION) + ")";
 }
 
+// M3-C: a valos munkaterulet merete (mm) - a SETUP 4 sarkaval egyutt ez adja
+// az auto-kalibracio bemenetet. Barmikor kiadhato (SETUP elott vagy utan is);
+// ha a SETUP mar kesz, azonnal ujra lefuttatja a kalibraciot es a racsot.
+String cmdSetArea(const String &args) {
+  int pos = 0;
+  String xStr = splitToken(args, pos, ',');
+  String yStr = args.substring(pos);
+  if (xStr.length() == 0 || yStr.length() == 0) return "HIBA: setArea formatum: XMAX,YMAX (mm)";
+  float xmax = xStr.toFloat(), ymax = yStr.toFloat();
+  if (xmax <= 0 || ymax <= 0) return "HIBA: XMAX,YMAX pozitiv legyen (mm)";
+  workAreaXMax = xmax;
+  workAreaYMax = ymax;
+  saveCalibration();
+  String result = "OK: munkaterulet = " + String(xmax, 1) + " x " + String(ymax, 1) + " mm";
+  if (gridCornerMask == 0x0F) {
+    if (runAutoCalibration()) {
+      computeGridCornerXY();
+      computeDefaultGridCells();
+      syncStateFromMotors();
+      result += " - AUTOKAL sikeres, racs ujraszamolva.";
+    } else {
+      result += " - AUTOKAL sikertelen (lasd log), a regi kalibraciot hasznaljuk.";
+    }
+  } else {
+    result += " - meg hianyzik SETUP sarok, AUTOKAL kesobb (a 4. sarok mentesekor) fut le.";
+  }
+  return result;
+}
+
+// M5.1: diagnosztikai lenyomat mindenrol, amit a MOVE/CELLS geometria hasznal -
+// gyors hibakereseshez (nem kell ujra beeploidolni logolashoz).
+String cmdGeom() {
+  String out;
+  out += "appMode=" + String(appMode == MODE_PLAY ? "PLAY" : "EDIT") + " editSubMode=" + String((int)editSubMode) + "\n";
+  if (motorA) out += "stepsA=" + String(motorA->getCurrentPosition()) + " ";
+  if (motorB) out += "stepsB=" + String(motorB->getCurrentPosition()) + "\n";
+  out += "moveU=" + String(moveU, 4) + " moveV=" + String(moveV, 4) + "\n";
+  out += "currentX=" + String(currentX, 2) + " currentY=" + String(currentY, 2) + " (PLAY mod, ANCHOR_A/B alapon)\n";
+  out += "gridCornerMask=" + String(gridCornerMask) + " gridCornerXYValid=" + String(gridCornerXYValid ? 1 : 0) + "\n";
+  for (int i = 0; i < 4; i++) {
+    out += "corner" + String(i) + ": A=" + String(gridCornerA[i]) + " B=" + String(gridCornerB[i]) +
+           " X=" + String(gridCornerX[i], 2) + " Y=" + String(gridCornerY[i], 2) + "\n";
+  }
+  out += "calValid=" + String(calValid ? 1 : 0) +
+         " calAx=" + String(calAx, 2) + " calAy=" + String(calAy, 2) +
+         " calBx=" + String(calBx, 2) + " calBy=" + String(calBy, 2) +
+         " calOffA=" + String(calOffAmm, 3) + " calOffB=" + String(calOffBmm, 3) + "\n";
+  out += "workAreaXMax=" + String(workAreaXMax, 1) + " workAreaYMax=" + String(workAreaYMax, 1) + "\n";
+  out += "STEPS_PER_MM=" + String(STEPS_PER_MM, 4) + " MICROSTEPPING=" + String(MICROSTEPPING, 0) + "\n";
+  return out;
+}
+
 String executeCommandLine(String line) {
   line.trim();
   if (line.length() == 0) return "";
@@ -1161,8 +1577,11 @@ String executeCommandLine(String line) {
   if (cmd == "testMagnet")   return cmdTestMagnet(args);
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
+  if (cmd == "setArea")      return cmdSetArea(args);
+  if (cmd == "geom")         return cmdGeom();
   return "HIBA: ismeretlen parancs: " + cmd;
 }
+
 
 // ============ SETUP / LOOP ============
 void setup() {
@@ -1210,10 +1629,12 @@ void setup() {
     loadAllCells();
   }
 
+  loadCalibration();
   loadGridCorners();
   loadGridCells();
-  webLogf("EDIT kalibracio: sarkak=%d/4, cellaracs=%s", __builtin_popcount(gridCornerMask),
-          gridCellsComputed ? "betoltve" : "nincs");
+  computeGridCornerXY();
+  webLogf("EDIT kalibracio: sarkak=%d/4, cellaracs=%s, autokal=%s", __builtin_popcount(gridCornerMask),
+          gridCellsComputed ? "betoltve" : "nincs", calValid ? "ervenyes" : "nincs");
 
   // ---- Mozgas-queue ----
   motionQueue = xQueueCreate(MOTION_QUEUE_LEN, sizeof(QueueItem));
@@ -1240,6 +1661,7 @@ void setup() {
   computeStringLengths(currentX, currentY, lenA, lenB);
   if (motorA) motorA->setCurrentPosition(mmToSteps(lenA));
   if (motorB) motorB->setCurrentPosition(mmToSteps(lenB));
+  syncStateFromMotors(); // M1: legjobb ismert (u,v) becsles boot-kor (ha van ervenyes kalibracio)
 
   Serial.println("Pick-and-place polargraph keszul (queue-alapu mozgatas, IBT-2 PWM magnes).");
 
