@@ -879,9 +879,11 @@ void jogMotorStop(FastAccelStepper *mot) {
 }
 
 // ============ MOVE/CELLS JOG: kalibralt racs-terben, normalizalt (u,v) ============
-// M2: mindket motor a SAJAT delta-javal aranyos sebesseget kap (nem egyforma
-// maximum sebesseget), igy egy szerre erkeznek a celba - ez adja az egyenes
-// vonalu, nem "foghijas" mozgast (H4 javitasa).
+// M2: mindket motor a SAJAT delta-javal aranyos sebesseget ES gyorsulast
+// kap (nem csak a sebesseget) - igy v_A/a_A = v_B/a_B = v_max/a_max
+// mindket tengelyen, tehat a gyorsitasi/lassitasi ido (t=v/a) egyenlo,
+// a palya a MOZGAS TELJES IDOTARTAMA alatt egyenes vonalu marad, nem
+// csak az allando sebessegu szakaszban (H4/H6 javitasa).
 void moveJogApply(float u, float v) {
   if (gridCornerMask != 0x0F || !motorA || !motorB) return;
   long ta, tb;
@@ -891,12 +893,15 @@ void moveJogApply(float u, float v) {
   long dMax = max(dA, dB);
   if (dMax == 0) return;
   uint32_t vMax = mmSpeedToStepsHz(JOG_SPEED_MM_S);
+  uint32_t aMax = mmAccelToStepsS2(JOG_ACCEL_MM_S2);
   uint32_t speedA = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dA) / (uint64_t)dMax));
   uint32_t speedB = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dB) / (uint64_t)dMax));
+  uint32_t accelA = max(1UL, (unsigned long)(((uint64_t)aMax * (uint64_t)dA) / (uint64_t)dMax));
+  uint32_t accelB = max(1UL, (unsigned long)(((uint64_t)aMax * (uint64_t)dB) / (uint64_t)dMax));
   motorA->setSpeedInHz(speedA);
   motorB->setSpeedInHz(speedB);
-  motorA->setAcceleration(mmAccelToStepsS2(JOG_ACCEL_MM_S2));
-  motorB->setAcceleration(mmAccelToStepsS2(JOG_ACCEL_MM_S2));
+  motorA->setAcceleration(accelA);
+  motorB->setAcceleration(accelB);
   motorA->moveTo(ta);
   motorB->moveTo(tb);
 }
@@ -915,32 +920,69 @@ void updateMoveJogTick() {
 
   static unsigned long lastReplanMs = 0;
   static bool jogWasActive = false;
+  // Uj allapot: gomb mar elengedve, de a motorok meg fekeznek - amig ez
+  // igaz, NEM szabad syncStateFromMotors()-t hivni, mert a lepesszamlalo
+  // meg egy koztes, tengelyenkent elteru pillanatban van (ez okozta az
+  // eredeti kumulalodo sullyedest).
+  static bool waitingForFullStop = false;
+  // melyik tengelyt hajtottuk a most vegzodo jog alatt (lasd a visszaszinkronizalast)
+  static bool drivenU = false, drivenV = false;
 
   bool anyHeld = (stableState[BTN8] == LOW) || (stableState[BTN2] == LOW) ||
                  (stableState[BTN4] == LOW) || (stableState[BTN5] == LOW);
+
   if (!anyHeld) {
     if (jogWasActive) {
+      // A moveJogApply() aranyos gyorsulast is ad, igy a fekut (v^2/2a) is
+      // aranyos a tengelyek delta-javal - a szabalyos stopMove() fekezes
+      // ezert egyenes vonalu marad mindket oldalon.
       motorA->stopMove();
       motorB->stopMove();
       jogWasActive = false;
-      syncStateFromMotors();
+      waitingForFullStop = true;
+    }
+    if (waitingForFullStop) {
+      if (!motorA->isRunning() && !motorB->isRunning()) {
+        float readU, readV;
+        if (gridUVForSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), readU, readV)) {
+          // A hajtott tengelyen a pozicio lemarad a celtol -> merni kell, kulonben
+          // a parancsolt ertek elszaladna. A nem hajtott tengelyen viszont csak a
+          // kotelhossz-interpolacio ive latszik -> a parancsolt erteket tartjuk,
+          // kulonben az iv ciklusonkent beleepulne (ez volt a kumulalodo sullyedes).
+          if (drivenU) moveU = readU;
+          if (drivenV) moveV = readV;
+        }
+        waitingForFullStop = false;
+        drivenU = drivenV = false;
+      }
     }
     return;
   }
+
+  // Uj gombnyomas jott, mielott a korabbi megallas lezarult volna -
+  // ervenytelenitjuk a varakozast, a kovetkezo replan ugyis uj celt ad.
+  waitingForFullStop = false;
 
   unsigned long now = millis();
   if (jogWasActive && (now - lastReplanMs) < JOG_REPLAN_MS) return; // meg ne tervezzunk ujra
   lastReplanMs = now;
   jogWasActive = true;
 
-  float curU, curV;
-  if (!gridUVForSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), curU, curV)) return;
+  // A bazis a PARANCSOLT (u,v), nem a mozgas kozben mert motorpozicio: a
+  // gridUVForSteps() maradekhibaja (Newton-tolerancia, constrain) kulonben
+  // minden replannal beleepulne a bazisba, es tiszta LEFT/RIGHT jognal a V
+  // iranyu hiba sose korrigalodna - ez volt a lassu sullyedes oka. A valos
+  // pozicioval csak nyugalmi allapotban hitelesitunk.
+  float curU = moveU, curV = moveV;
+  if (!motorA->isRunning() && !motorB->isRunning()) {
+    gridUVForSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), curU, curV);
+  }
 
   float tgtU = curU, tgtV = curV;
-  if (stableState[BTN8] == LOW) tgtU -= JOG_LOOKAHEAD; // LEFT
-  if (stableState[BTN2] == LOW) tgtU += JOG_LOOKAHEAD; // RIGHT
-  if (stableState[BTN4] == LOW) tgtV -= JOG_LOOKAHEAD; // UP
-  if (stableState[BTN5] == LOW) tgtV += JOG_LOOKAHEAD; // DOWN
+  if (stableState[BTN8] == LOW) { tgtU -= JOG_LOOKAHEAD; drivenU = true; } // LEFT
+  if (stableState[BTN2] == LOW) { tgtU += JOG_LOOKAHEAD; drivenU = true; } // RIGHT
+  if (stableState[BTN4] == LOW) { tgtV -= JOG_LOOKAHEAD; drivenV = true; } // UP
+  if (stableState[BTN5] == LOW) { tgtV += JOG_LOOKAHEAD; drivenV = true; } // DOWN
   tgtU = constrain(tgtU, 0.0f, 1.0f);
   tgtV = constrain(tgtV, 0.0f, 1.0f);
   moveU = tgtU; moveV = tgtV; // tajekoztato allapot (pl. MOVE ENTER log-jahoz)
