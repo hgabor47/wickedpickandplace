@@ -78,6 +78,15 @@ const float ANCHOR_B_X =  756.0, ANCHOR_B_Y = -210.0;
 // ANCHOR_A/B-bol computeStringLengths()-szel visszaszamolt (kozelito) ertekek.
 const float ORIGIN_LEN_A_MM = 260.0;
 const float ORIGIN_LEN_B_MM = 780.0;
+// A kulissza (gondola) egy szabadon forgo korong: a ket fonal nem a kozeppontban,
+// hanem a keruleten, a korong sajat "felfele" jelehez kepest -/+45 fokban van
+// rogzitve. A korong elfordulasi szoge (theta) helyzetfuggo, statikai
+// egyensulybol adodik - ezert a kinematika nem pontszeru (lasd lejjebb).
+const float GONDOLA_RADIUS_MM = 85.0;
+const float GONDOLA_ARM_ANGLE_RAD = 45.0 * (PI / 180.0);
+// Kulon warm-start a ket iranynak: kereszt-szennyezes nelkul gyorsabban konvergalnak.
+static float lastThetaForward = 0.0f;
+static float lastThetaInverse = 0.0f;
 // A motorok forgasiranya (bekotes/konfiguracio fuggo) - ha a mechanika/DIR
 // bekotes valtozik, csak ezt kell modositani, a tobbi szamitason nem valtoztat.
 const bool DIR_A_INVERT = false;
@@ -398,11 +407,88 @@ float currentX = 0.0, currentY = 0.0;
 bool penDown = false;
 
 // ============ KINEMATIKA ============
+// ---- iteracios parameterek (forward es inverz irany kozosen hasznalja) ----
+static const int   TRI_MAX_ITER      = 12;      // 1D Newton lepesek
+static const int   TRI_SCAN_STEPS    = 48;      // durva scan felbontas (tartalek)
+static const int   TRI_BISECT_ITER   = 24;      // bisekcio lepesszam
+static const float TRI_TORQUE_TOL    = 2.0e-5f; // elfogadasi kuszob (normalt)
+static const float TRI_TORQUE_ACCEPT = 1.0e-3f; // "meg elfogadhato" kuszob
+static const float TRI_THETA_H       = 0.002f;  // rad - numerikus derivalt lepese
+static const float THETA_MIN         = -1.2f;
+static const float THETA_MAX         =  1.2f;
+
+// A gondola-modell EGYETLEN definicios helye - a forward es az inverz irany is
+// ezt hasznalja, igy nem tudnak szetcsuszni.
+//
+// A nyomateki reziduum POLUSMENTES alakban: a naiv `tA*mA + mB` (ahol
+// tA = -uBx/uAx) ott szingularis, ahol az A kotel fuggolegesse valik. uAx-szel
+// felszorozva a gyokok ugyanazok maradnak, de eltunik az osztas es az eseti ag.
+// R-rel normalva dimenziotlan, O(1) nagysagrendu.
+//   visszateres: g (normalt nyomateki reziduum, gyoke = statikai egyensuly)
+static float gondolaTorqueAt(float x, float y, float theta,
+                             float &lenA, float &lenB, float &tA) {
+  float phiA = theta - GONDOLA_ARM_ANGLE_RAD;
+  float rAx  =  GONDOLA_RADIUS_MM * sin(phiA);
+  float rAy  = -GONDOLA_RADIUS_MM * cos(phiA);
+  float vAx  = ANCHOR_A_X - (x + rAx), vAy = ANCHOR_A_Y - (y + rAy);
+  float dA   = sqrt(vAx * vAx + vAy * vAy);
+  if (dA < 1e-3f) { lenA = lenB = 0; tA = -1.0f; return 0.0f; }
+  float uAx = vAx / dA, uAy = vAy / dA;
+
+  float phiB = theta + GONDOLA_ARM_ANGLE_RAD;
+  float rBx  =  GONDOLA_RADIUS_MM * sin(phiB);
+  float rBy  = -GONDOLA_RADIUS_MM * cos(phiB);
+  float vBx  = ANCHOR_B_X - (x + rBx), vBy = ANCHOR_B_Y - (y + rBy);
+  float dB   = sqrt(vBx * vBx + vBy * vBy);
+  if (dB < 1e-3f) { lenA = lenB = 0; tA = -1.0f; return 0.0f; }
+  float uBx = vBx / dB, uBy = vBy / dB;
+
+  float mA = rAx * uAy - rAy * uAx;
+  float mB = rBx * uBy - rBy * uBx;
+
+  lenA = dA;
+  lenB = dB;
+  // tA csak ERVENYESSEG-ELLENORZESRE kell (pozitiv koteleroet varunk),
+  // a megoldasba nem szol bele - ezert itt nyugodtan lehet osztani.
+  tA = (fabs(uAx) > 1e-6f) ? (-uBx / uAx) : -1.0f;
+  return (-uBx * mA + uAx * mB) / GONDOLA_RADIUS_MM;
+}
+
+// FORWARD: (X,Y) -> kotelhosszak. Egyetlen ismeretlen (theta), csillapitott
+// 1D Newton - a line search miatt nem tud tullendulni. A suly csak
+// fuggolegesen hat, igy az eroaranyt (es ezzel theta-t) nem befolyasolja:
+// a modell sulyfuggetlen.
 void computeStringLengths(float x, float y, float &lenA, float &lenB) {
-  float dxA = x - ANCHOR_A_X, dyA = y - ANCHOR_A_Y;
-  float dxB = x - ANCHOR_B_X, dyB = y - ANCHOR_B_Y;
-  lenA = sqrt(dxA * dxA + dyA * dyA);
-  lenB = sqrt(dxB * dxB + dyB * dyB);
+  float theta = constrain(lastThetaForward, THETA_MIN, THETA_MAX);
+  float tA;
+  float g = gondolaTorqueAt(x, y, theta, lenA, lenB, tA);
+
+  for (int iter = 0; iter < TRI_MAX_ITER; iter++) {
+    if (fabs(g) < TRI_TORQUE_TOL) break;
+    float thH = min(THETA_MAX, theta + TRI_THETA_H);
+    float lA_h, lB_h, tA_h;
+    float gH = gondolaTorqueAt(x, y, thH, lA_h, lB_h, tA_h);
+    float deriv = (gH - g) / (thH - theta);
+    if (fabs(deriv) < 1e-9f) break;
+
+    float step = g / deriv;
+    float lambda = 1.0f;
+    bool improved = false;
+    for (int bt = 0; bt < 8; bt++) {
+      float thNew = constrain(theta - lambda * step, THETA_MIN, THETA_MAX);
+      float lA_n, lB_n, tA_n;
+      float gNew = gondolaTorqueAt(x, y, thNew, lA_n, lB_n, tA_n);
+      if (fabs(gNew) < fabs(g)) {
+        theta = thNew; g = gNew; lenA = lA_n; lenB = lB_n; tA = tA_n;
+        improved = true;
+        break;
+      }
+      lambda *= 0.5f;
+    }
+    if (!improved) break; // elertuk a float32 zajszintet
+  }
+
+  lastThetaForward = theta;
 }
 
 long mmToSteps(float mm) { return (long)round(mm * STEPS_PER_MM); }
@@ -737,21 +823,145 @@ bool circleIntersectBelow(float ax, float ay, float bx, float by,
   return true;
 }
 
-// step-parbol (motorA/motorB nyers pozicio) valodi (X,Y)-t szamol - fix,
-// kezzel megmert ANCHOR_A/B horgonypoziciokat hasznalja (nincs horgony-
-// illesztes/eltolas) - ez az EGYETLEN hely, ahol step->(X,Y) tortenik az
-// EDIT-mod racs-rendszereben (M1: egyetlen igazsagforras).
-bool trilaterateSteps(long stepsA, long stepsB, float &outX, float &outY) {
-  float lenA = stepsA / STEPS_PER_MM;
-  float lenB = stepsB / STEPS_PER_MM;
-  return circleIntersectBelow(ANCHOR_A_X, ANCHOR_A_Y, ANCHOR_B_X, ANCHOR_B_Y, lenA, lenB, outX, outY);
+// Adott theta mellett a korong kozeppontja ZART KEPLETTEL: a rogzitesi pont
+// eltolasat levonjuk a horgonybol ("virtualis horgony"), es a ket kotelhossz
+// mint sugar egy sima kor-metszest ad. Igy a kotelhossz-egyenletek MINDIG
+// pontosan teljesulnek, barmilyen theta mellett - csak theta marad ismeretlen.
+static bool gondolaSolveAtTheta(float theta, float targetLenA, float targetLenB,
+                                float &x, float &y, float &g, float &tA) {
+  float phiA = theta - GONDOLA_ARM_ANGLE_RAD;
+  float rAx  =  GONDOLA_RADIUS_MM * sin(phiA);
+  float rAy  = -GONDOLA_RADIUS_MM * cos(phiA);
+  float phiB = theta + GONDOLA_ARM_ANGLE_RAD;
+  float rBx  =  GONDOLA_RADIUS_MM * sin(phiB);
+  float rBy  = -GONDOLA_RADIUS_MM * cos(phiB);
+
+  if (!circleIntersectBelow(ANCHOR_A_X - rAx, ANCHOR_A_Y - rAy,
+                            ANCHOR_B_X - rBx, ANCHOR_B_Y - rBy,
+                            targetLenA, targetLenB, x, y)) {
+    return false;
+  }
+  float lA, lB;
+  g = gondolaTorqueAt(x, y, theta, lA, lB, tA);
+  return true;
 }
 
-// (X,Y) -> step-par, a trilaterateSteps() inverze - ugyanazt a fix ANCHOR_A/B-t
-// hasznalja, mint trilaterateSteps().
+// INVERZ: step-par -> valodi (X,Y).
+// Ez az EGYETLEN hely, ahol step->(X,Y) tortenik (M1: egyetlen igazsagforras).
+bool trilaterateSteps(long stepsA, long stepsB, float &outX, float &outY) {
+  float targetLenA = stepsA / STEPS_PER_MM;
+  float targetLenB = stepsB / STEPS_PER_MM;
+
+  float theta = constrain(lastThetaInverse, THETA_MIN, THETA_MAX);
+  float x, y, g, tA;
+  bool  have = gondolaSolveAtTheta(theta, targetLenA, targetLenB, x, y, g, tA);
+  if (!have) { // warm-start nem hasznalhato -> hideg indulas
+    theta = 0.0f;
+    have  = gondolaSolveAtTheta(theta, targetLenA, targetLenB, x, y, g, tA);
+  }
+
+  // --- 1. fazis: csillapitott 1D Newton theta-ra ---
+  if (have) {
+    for (int iter = 0; iter < TRI_MAX_ITER; iter++) {
+      if (fabs(g) < TRI_TORQUE_TOL) break;
+      float thH = min(THETA_MAX, theta + TRI_THETA_H);
+      float xH, yH, gH, tAH;
+      if (!gondolaSolveAtTheta(thH, targetLenA, targetLenB, xH, yH, gH, tAH)) break;
+      float deriv = (gH - g) / (thH - theta);
+      if (fabs(deriv) < 1e-9f) break;
+
+      float step = g / deriv;
+      float lambda = 1.0f;
+      bool improved = false;
+      for (int bt = 0; bt < 8; bt++) {
+        float thNew = constrain(theta - lambda * step, THETA_MIN, THETA_MAX);
+        float xN, yN, gN, tAN;
+        if (gondolaSolveAtTheta(thNew, targetLenA, targetLenB, xN, yN, gN, tAN) &&
+            fabs(gN) < fabs(g)) {
+          theta = thNew; x = xN; y = yN; g = gN; tA = tAN;
+          improved = true;
+          break;
+        }
+        lambda *= 0.5f;
+      }
+      if (!improved) break; // float32 zajszint
+    }
+  }
+
+  // --- 2. fazis (tartalek): durva scan + bisekcio, ha a Newton nem ert celba ---
+  if (!have || fabs(g) > TRI_TORQUE_ACCEPT) {
+    bool  havePrev = false;
+    float prevTh = 0, prevG = 0;
+    float loTh = 0, loG = 0, hiTh = 0;
+    bool  bracketed = false;
+
+    for (int i = 0; i <= TRI_SCAN_STEPS; i++) {
+      float t = THETA_MIN + (THETA_MAX - THETA_MIN) * ((float)i / (float)TRI_SCAN_STEPS);
+      float xs, ys, gs, tAs;
+      if (!gondolaSolveAtTheta(t, targetLenA, targetLenB, xs, ys, gs, tAs)) {
+        havePrev = false; // ertelmezesi tartomanyon kivul
+        continue;
+      }
+      // Elojelvaltast csak akkor fogadunk el gyoknek, ha mindket oldal KICSI -
+      // igy nem ulunk fel egy esetleges ugrasnak.
+      if (havePrev && prevG * gs < 0 && fabs(prevG) < 2.0f && fabs(gs) < 2.0f) {
+        loTh = prevTh; loG = prevG; hiTh = t;
+        bracketed = true;
+        break;
+      }
+      havePrev = true; prevTh = t; prevG = gs;
+    }
+
+    if (!bracketed) {
+      lastThetaInverse = 0.0f; // ne mergezzuk a kovetkezo hivast
+      webLogf("KINEMATIKA: nincs egyensulyi theta (stepsA=%ld, stepsB=%ld, lenA=%.1f, lenB=%.1f)",
+              stepsA, stepsB, targetLenA, targetLenB);
+      return false;
+    }
+
+    for (int b = 0; b < TRI_BISECT_ITER; b++) {
+      float mid = 0.5f * (loTh + hiTh);
+      float xm, ym, gm, tAm;
+      if (!gondolaSolveAtTheta(mid, targetLenA, targetLenB, xm, ym, gm, tAm)) break;
+      if (loG * gm <= 0) { hiTh = mid; }
+      else               { loTh = mid; loG = gm; }
+      theta = mid; x = xm; y = ym; g = gm; tA = tAm;
+    }
+  }
+
+  // --- 3. fazis: fizikai ervenyesseg ---
+  // A kotel csak HUZNI tud: tA <= 0 egy matematikailag letezo, de fizikailag
+  // lehetetlen gyokot jelent.
+  if (tA <= 0.0f) {
+    lastThetaInverse = 0.0f;
+    webLogf("KINEMATIKA: fizikailag ervenytelen gyok - negativ koteleroe (stepsA=%ld, stepsB=%ld, x=%.1f, y=%.1f, th=%.3f, tA=%.2f)",
+            stepsA, stepsB, x, y, theta, tA);
+    return false;
+  }
+  if (y <= ANCHOR_A_Y || y <= ANCHOR_B_Y) {
+    lastThetaInverse = 0.0f;
+    webLogf("KINEMATIKA: fizikailag ervenytelen gyok - a kulissza a horgonyok folott (stepsA=%ld, stepsB=%ld, x=%.1f, y=%.1f, th=%.3f)",
+            stepsA, stepsB, x, y, theta);
+    return false;
+  }
+  if (fabs(g) > TRI_TORQUE_ACCEPT) {
+    lastThetaInverse = 0.0f;
+    webLogf("KINEMATIKA: nem konvergalt (stepsA=%ld, stepsB=%ld, x=%.1f, y=%.1f, th=%.3f, g=%.6f, tA=%.2f)",
+            stepsA, stepsB, x, y, theta, g, tA);
+    return false;
+  }
+
+  outX = x;
+  outY = y;
+  lastThetaInverse = theta; // warm-start CSAK sikeres gyokre
+  return true;
+}
+
+// (X,Y) -> step-par, a trilaterateSteps() inverze - ugyanazt a gondola-modellt
+// hasznalja (computeStringLengths), igy a ket irany konzisztens.
 void xyToSteps(float x, float y, long &outA, long &outB) {
-  float lenA = sqrt(sq(x - ANCHOR_A_X) + sq(y - ANCHOR_A_Y));
-  float lenB = sqrt(sq(x - ANCHOR_B_X) + sq(y - ANCHOR_B_Y));
+  float lenA, lenB;
+  computeStringLengths(x, y, lenA, lenB);
   outA = mmToSteps(lenA);
   outB = mmToSteps(lenB);
 }
@@ -932,7 +1142,7 @@ void moveJogApply(float u, float v, bool startNewLine) {
   if (startNewLine) {
     // uj egyenes indul a motor TENYLEGES jelenlegi poziciojabol a tavoli
     // celig - ez csak az iranyt/hosszat hatarozza meg, allapotot nem ir felul.
-    trilaterateSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), jogLineStartX, jogLineStartY);
+    if (!trilaterateSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), jogLineStartX, jogLineStartY)) return;
     gridUVToXY(u, v, jogLineEndX, jogLineEndY);
     float dist = sqrt(sq(jogLineEndX - jogLineStartX) + sq(jogLineEndY - jogLineStartY));
     jogSegCount = max(1, (int)ceil(dist / JOG_SEGMENT_LEN_MM));
@@ -1049,6 +1259,12 @@ void updatePendingMenuActions() {
     pendingSetupEntry = false;
     if (appMode == MODE_EDIT && editSubMode == EDIT_MENU) {
       editSubMode = EDIT_SETUP;
+      // Friss kalibracio indul: a regi sarkok mar nem ervenyesek. Enelkul a
+      // felkesz SETUP alatt a mar betoltott (regi) sarkokhoz hasonlitanank
+      // (hamis "nem mozdult el eleget" elutasitas), es minden mentes teljes
+      // ujraszamolast valtana ki hibauzenettel.
+      gridCornerMask = 0;
+      gridCornerXYValid = false;
       webLog("EDIT almod: SETUP");
       ackRight(2);
     }
@@ -1249,6 +1465,13 @@ void onButtonPressed(int i) {
   if (i == BTN3 && tapCount[BTN3] == 3) {
     tapCount[BTN3] = 0;
     pendingSetupCornerStore = false; // ne fusson le kesobb egy mar ervenytelenitett tarolas
+    // Felbehagyott SETUP: a belepeskor kinullazott RAM-allapot helyett allitsuk
+    // vissza az NVS-ben meg meglevo, ervenyes kalibraciot.
+    if (editSubMode == EDIT_SETUP && gridCornerMask != 0x0F) {
+      loadGridCorners();
+      computeGridCornerXY();
+      webLog("SETUP megszakitva - a korabbi kalibracio visszaallitva.");
+    }
     editSubMode = EDIT_MENU;
     webLog("Vissza az EDIT menube (ESC x3).");
     ackLeft(2);
@@ -1476,6 +1699,9 @@ String cmdGeom() {
   }
   out += "ANCHOR_A=(" + String(ANCHOR_A_X, 1) + "," + String(ANCHOR_A_Y, 1) + ") ANCHOR_B=(" +
          String(ANCHOR_B_X, 1) + "," + String(ANCHOR_B_Y, 1) + ")\n";
+  out += "GONDOLA_RADIUS_MM=" + String(GONDOLA_RADIUS_MM, 1) +
+         " ARM_ANGLE_DEG=" + String(GONDOLA_ARM_ANGLE_RAD * 180.0 / PI, 1) +
+         " thetaFwd=" + String(lastThetaForward, 4) + " thetaInv=" + String(lastThetaInverse, 4) + "\n";
   out += "STEPS_PER_MM=" + String(STEPS_PER_MM, 4) + " MICROSTEPPING=" + String(MICROSTEPPING, 0) + "\n";
   return out;
 }
