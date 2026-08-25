@@ -70,8 +70,18 @@ bool pendingSetupCornerStore = false;
 unsigned long pendingSetupCornerTime = 0;
 
 // ============ GÉP GEOMETRIA ============
-const float ANCHOR_A_X = -200, ANCHOR_A_Y = -200;
-const float ANCHOR_B_X =  920, ANCHOR_B_Y = -200;
+// Merve: origo (0,0)-ban a kotelhossz A-n 260mm, B-n 780mm - ebbol vissza-
+// szamolva a horgonypoziciok (a korabbi -200/-200 es 920/-200 becslesek voltak).
+const float ANCHOR_A_X = -155.0, ANCHOR_A_Y = -205.0;
+const float ANCHOR_B_X =  755.0, ANCHOR_B_Y = -205.0;
+// Origoban (0,0) mert kotelhosszak - ezek a hiteles referenciak, nem az
+// ANCHOR_A/B-bol computeStringLengths()-szel visszaszamolt (kozelito) ertekek.
+const float ORIGIN_LEN_A_MM = 260.0;
+const float ORIGIN_LEN_B_MM = 780.0;
+// A motorok forgasiranya (bekotes/konfiguracio fuggo) - ha a mechanika/DIR
+// bekotes valtozik, csak ezt kell modositani, a tobbi szamitason nem valtoztat.
+const bool DIR_A_INVERT = false;
+const bool DIR_B_INVERT = false;
 
 // Motor: 1.8 fok/lepes (200 lepes/fordulat). A4988 microstepping: MS2 +3.3V-ra
 // kotve -> 1/4 step (MS1/MS3 GND-n). Ha az MS1/2/3 bekotes valtozik, csak ezt
@@ -384,7 +394,7 @@ FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *motorA = NULL;
 FastAccelStepper *motorB = NULL;
 
-float currentX = 680.0, currentY = 70.0;
+float currentX = 0.0, currentY = 0.0;
 bool penDown = false;
 
 // ============ KINEMATIKA ============
@@ -957,9 +967,28 @@ void updatePendingMenuActions() {
 }
 
 // ============ EDIT ALMOD: SETUP ============
+// Minimum lepestavolsag, aminek meg kell lennie egy uj sarok es az osszes mar
+// tarolt sarok kozott - ha nem mozdultak el eleg messze a motorok (pl. a
+// gomb tevedesbol mozgatas nelkul lett megnyomva), a mentes elutasitva.
+const long MIN_CORNER_DELTA_MM = 10;
+
 void storeCorner(int cornerIdx, const char *label) {
-  gridCornerA[cornerIdx] = motorA->getCurrentPosition();
-  gridCornerB[cornerIdx] = motorB->getCurrentPosition();
+  long curA = motorA->getCurrentPosition();
+  long curB = motorB->getCurrentPosition();
+  long minDeltaSteps = mmToSteps(MIN_CORNER_DELTA_MM);
+  for (int j = 0; j < 4; j++) {
+    if (j == cornerIdx || !(gridCornerMask & (1 << j))) continue;
+    // Polargraph geometriaban egyenes vonalu elmozdulasnal is mindket
+    // kotelhossznak valtoznia kell - ezert barmelyik motor kis elmozdulasa
+    // (nem csak mindketto egyutt) mar ervenytelenne teszi a sarkot.
+    if (abs(curA - gridCornerA[j]) < minDeltaSteps || abs(curB - gridCornerB[j]) < minDeltaSteps) {
+      webLogf("SETUP: sarok '%s' ELUTASITVA - valamelyik motor nem mozdult el elegendoet a %d. sarokhoz kepest.", label, j);
+      ackLeft(4);
+      return;
+    }
+  }
+  gridCornerA[cornerIdx] = curA;
+  gridCornerB[cornerIdx] = curB;
   gridCornerMask |= (1 << cornerIdx);
   saveGridCorners();
   webLogf("SETUP: sarok '%s' tarolva (A=%ld, B=%ld)", label, gridCornerA[cornerIdx], gridCornerB[cornerIdx]);
@@ -1421,18 +1450,18 @@ void setup() {
   if (!motorB) Serial.println("FIGYELEM: motorB (STEP_B_PIN=27) csatlakoztatasa sikertelen!");
 
   if (motorA) {
-    motorA->setDirectionPin(DIR_A_PIN);
+    motorA->setDirectionPin(DIR_A_PIN, DIR_A_INVERT);
     motorA->setAutoEnable(false);
   }
   if (motorB) {
-    motorB->setDirectionPin(DIR_B_PIN);
+    motorB->setDirectionPin(DIR_B_PIN, DIR_B_INVERT);
     motorB->setAutoEnable(false);
   }
 
-  float lenA, lenB;
-  computeStringLengths(currentX, currentY, lenA, lenB);
-  if (motorA) motorA->setCurrentPosition(mmToSteps(lenA));
-  if (motorB) motorB->setCurrentPosition(mmToSteps(lenB));
+  // Boot-kor a gepet mindig kezzel (0,0)-ba kell allitani - a merve ismert
+  // origo-kotelhosszakat irjuk be, nem az ANCHOR_A/B-bol visszaszamolt kozelitest.
+  if (motorA) motorA->setCurrentPosition(mmToSteps(ORIGIN_LEN_A_MM));
+  if (motorB) motorB->setCurrentPosition(mmToSteps(ORIGIN_LEN_B_MM));
   syncStateFromMotors(); // M1: legjobb ismert (u,v) becsles boot-kor (ha van ervenyes kalibracio)
 
   Serial.println("Pick-and-place polargraph keszul (queue-alapu mozgatas, IBT-2 PWM magnes).");
