@@ -864,8 +864,10 @@ void ackLeft(int times)  { ackPulse(motorA, times); }  // motorA = A-horgony ("L
 void ackRight(int times) { ackPulse(motorB, times); }  // motorB = B-horgony ("RIGHT")
 
 // ============ NYERS MOTOR-JOG (SETUP): nyomva tartas alatt folyamatos ============
-const float JOG_SPEED_MM_S  = 80.0;
-const float JOG_ACCEL_MM_S2 = 500.0;
+// Uzem kozben allithato a setSpeed paranccsal (lasd cmdSetSpeed) - tul magas
+// ertekek mellett a stepper (kulonosen A) idonkent megszaladt/lepesvesztett.
+float JOG_SPEED_MM_S  = 40.0;
+float JOG_ACCEL_MM_S2 = 250.0;
 
 void jogMotorStart(FastAccelStepper *mot, int dir) {
   mot->setSpeedInHz(mmSpeedToStepsHz(JOG_SPEED_MM_S));
@@ -905,8 +907,8 @@ void moveJogApply(float u, float v) {
 // nem egy szabadon "elszaladhato" belso u/v valtozobol), egy rovid
 // "lookahead"-del a nyomott irany(ok)ba. Elengedeskor azonnal megallitja a
 // motort es szinkronizalja az allapotot a tenyleges pozicioval.
-const float JOG_LOOKAHEAD = 0.05f; // a 0..1 racs-tartomany ennyi resze / ujratervezes
-const unsigned long JOG_REPLAN_MS = 30;
+float JOG_LOOKAHEAD = 0.02f; // a 0..1 racs-tartomany ennyi resze / ujratervezes
+unsigned long JOG_REPLAN_MS = 50;
 void updateMoveJogTick() {
   if (appMode != MODE_EDIT) return;
   if (editSubMode != EDIT_MOVE && editSubMode != EDIT_CELLS) return;
@@ -1345,6 +1347,29 @@ String cmdClearCells() {
   return "OK: minden cella torolve, formatum ujrainicializalva (v" + String(CELL_FORMAT_VERSION) + ")";
 }
 
+// setSpeed JOG_SPEED_MM_S,JOG_ACCEL_MM_S2,JOG_REPLAN_MS,JOG_LOOKAHEAD - pl. 40.00,250.00,50,0.02
+String cmdSetSpeed(const String &args) {
+  int pos = 0;
+  String speedStr = splitToken(args, pos, ',');
+  String accelStr = splitToken(args, pos, ',');
+  String replanStr = splitToken(args, pos, ',');
+  String lookaheadStr = args.substring(pos);
+  if (speedStr.length() == 0 || accelStr.length() == 0 || replanStr.length() == 0 || lookaheadStr.length() == 0) {
+    return "HIBA: setSpeed formatum: SPEED_MM_S,ACCEL_MM_S2,REPLAN_MS,LOOKAHEAD";
+  }
+  float speed = speedStr.toFloat();
+  float accel = accelStr.toFloat();
+  long replan = replanStr.toInt();
+  float lookahead = lookaheadStr.toFloat();
+  if (speed <= 0 || accel <= 0 || replan <= 0 || lookahead <= 0) return "HIBA: minden ertek pozitiv kell legyen";
+  JOG_SPEED_MM_S = speed;
+  JOG_ACCEL_MM_S2 = accel;
+  JOG_REPLAN_MS = (unsigned long)replan;
+  JOG_LOOKAHEAD = lookahead;
+  return "OK: JOG_SPEED_MM_S=" + String(JOG_SPEED_MM_S, 2) + " JOG_ACCEL_MM_S2=" + String(JOG_ACCEL_MM_S2, 2) +
+         " JOG_REPLAN_MS=" + String(JOG_REPLAN_MS) + " JOG_LOOKAHEAD=" + String(JOG_LOOKAHEAD, 2);
+}
+
 // M5.1: diagnosztikai lenyomat mindenrol, amit a MOVE/CELLS geometria hasznal -
 // gyors hibakereseshez (nem kell ujra beeploidolni logolashoz).
 String cmdGeom() {
@@ -1380,6 +1405,7 @@ String executeCommandLine(String line) {
   if (cmd == "testMagnet")   return cmdTestMagnet(args);
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
+  if (cmd == "setSpeed")     return cmdSetSpeed(args);
   if (cmd == "geom")         return cmdGeom();
   return "HIBA: ismeretlen parancs: " + cmd;
 }
