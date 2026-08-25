@@ -410,43 +410,68 @@ long mmToSteps(float mm) { return (long)round(mm * STEPS_PER_MM); }
 uint32_t mmSpeedToStepsHz(float mmPerSec)   { return (uint32_t)max(1L, (long)round(mmPerSec * STEPS_PER_MM)); }
 uint32_t mmAccelToStepsS2(float mmPerSec2)  { return (uint32_t)max(1L, (long)round(mmPerSec2 * STEPS_PER_MM)); }
 
-void moveTo(float x, float y, float speedMmPerSec) {
-  float lenA, lenB, curLenA, curLenB;
-  computeStringLengths(x, y, lenA, lenB);
-  computeStringLengths(currentX, currentY, curLenA, curLenB);
-
-  long targetStepsA = mmToSteps(lenA);
-  long targetStepsB = mmToSteps(lenB);
-  long deltaA = abs(targetStepsA - motorA->getCurrentPosition());
-  long deltaB = abs(targetStepsB - motorB->getCurrentPosition());
-  long maxDelta = max(deltaA, deltaB);
-  if (maxDelta == 0) { currentX = x; currentY = y; return; }
-
-  float totalLenDelta = max(abs(lenA - curLenA), abs(lenB - curLenB));
-  float durationSec = totalLenDelta / speedMmPerSec;
-  if (durationSec <= 0) durationSec = 0.05;
-
-  uint32_t speedA = max(1L, (long)(deltaA / durationSec));
-  uint32_t speedB = max(1L, (long)(deltaB / durationSec));
-
+// Kozos "aranyos" mozgas-inditas: mindket motor a SAJAT delta-javal aranyos
+// sebesseget ES gyorsulast kap, igy egyszerre indulnak/ernek celba - a mozgas
+// TELJES idotartama alatt egyenes vonalu marad, nem csak az allando sebessegu
+// szakaszban. Ezt hasznalja a jog (moveJogApply) es a PLAY-mod szegmentalt
+// vonalkovetese (moveToBlocking) is - igy a ket mozgatasi ut egysegesitve van.
+void applyProportionalMove(long targetA, long targetB, float speedMmPerSec, float accelMmPerS2) {
+  long curA = motorA->getCurrentPosition(), curB = motorB->getCurrentPosition();
+  long dA = abs(targetA - curA), dB = abs(targetB - curB);
+  long dMax = max(dA, dB);
+  if (dMax == 0) return;
+  uint32_t vMax = mmSpeedToStepsHz(speedMmPerSec);
+  uint32_t aMax = mmAccelToStepsS2(accelMmPerS2);
+  uint32_t speedA = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dA) / (uint64_t)dMax));
+  uint32_t speedB = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dB) / (uint64_t)dMax));
+  uint32_t accelA = max(1UL, (unsigned long)(((uint64_t)aMax * (uint64_t)dA) / (uint64_t)dMax));
+  uint32_t accelB = max(1UL, (unsigned long)(((uint64_t)aMax * (uint64_t)dB) / (uint64_t)dMax));
   motorA->setSpeedInHz(speedA);
   motorB->setSpeedInHz(speedB);
-  motorA->setAcceleration(mmAccelToStepsS2(ACCEL_MM_S2));
-  motorB->setAcceleration(mmAccelToStepsS2(ACCEL_MM_S2));
-  motorA->moveTo(targetStepsA);
-  motorB->moveTo(targetStepsB);
-
-  currentX = x;
-  currentY = y;
+  motorA->setAcceleration(accelA);
+  motorB->setAcceleration(accelB);
+  motorA->moveTo(targetA);
+  motorB->moveTo(targetB);
 }
+
+// Ennel hosszabb mozgast szegmensekre bontunk: a step-terbeli egyenes
+// interpolacio hosszu tavon a valos XY-sikban ivnek latszana (a trilateracios
+// step<->XY lekepezes nemlinearis), ezert a VALODI XY-egyenes menten
+// szamolunk kozbenso pontokat.
+const float PLAY_SEGMENT_LEN_MM = 3.0f;
+// Kozbenso szegmensnel ennyire kell csak megkozeliteni a celt ahhoz, hogy a
+// kovetkezo szegmensre valthassunk - igy a motor nem all meg teljesen minden
+// waypointnal, csak a mozgas legvegen (a valodi celnal).
+const long PLAY_WAYPOINT_TOLERANCE_STEPS = 3;
 
 // Csak a Core0-motionExecTask hívja - itt a blokkolás nem gond, mert ez a mag
 // KIZÁRÓLAG ezt csinálja, a gombolvasás/webszerver a másik magon fut tovább.
-void moveToBlocking(float x, float y, float speed) {
-  moveTo(x, y, speed);
-  while (motorA->isRunning() || motorB->isRunning()) {
-    delay(2);
+void moveToBlocking(float x, float y, float speedMmPerSec) {
+  float startX = currentX, startY = currentY;
+  float distX = x - startX, distY = y - startY;
+  float totalDist = sqrt(distX * distX + distY * distY);
+  if (totalDist < 0.01f) { currentX = x; currentY = y; return; }
+
+  int segments = max(1, (int)ceil(totalDist / PLAY_SEGMENT_LEN_MM));
+  for (int i = 1; i <= segments; i++) {
+    float t = (float)i / segments;
+    float lenA, lenB;
+    computeStringLengths(startX + distX * t, startY + distY * t, lenA, lenB);
+    long ta = mmToSteps(lenA), tb = mmToSteps(lenB);
+    applyProportionalMove(ta, tb, speedMmPerSec, ACCEL_MM_S2);
+
+    bool isLast = (i == segments);
+    while (motorA->isRunning() || motorB->isRunning()) {
+      if (!isLast &&
+          abs(ta - motorA->getCurrentPosition()) <= PLAY_WAYPOINT_TOLERANCE_STEPS &&
+          abs(tb - motorB->getCurrentPosition()) <= PLAY_WAYPOINT_TOLERANCE_STEPS) {
+        break; // kozel eleg a kozbenso waypointhoz - folytatjuk megallas nelkul
+      }
+      delay(2);
+    }
   }
+  currentX = x;
+  currentY = y;
 }
 
 // ============ ELEKTROMÁGNES: BOOST-THEN-HOLD ============
@@ -767,10 +792,15 @@ void computeGridCornerXY() {
   }
 }
 
-// u: 0=X-min .. 1=X-max oldal, v: 0=Y-min .. 1=Y-max oldal
+// u: 0=X-min .. 1=X-max oldal, v: 0=Y-min .. 1=Y-max oldal - a cel VALOS
+// (X,Y) koordinatait adja vissza (a sarkok kozotti linearis interpolaciobol).
+void gridUVToXY(float u, float v, float &outX, float &outY) {
+  outX = bilerpFloat(gridCornerX[0], gridCornerX[2], gridCornerX[1], gridCornerX[3], u, v);
+  outY = bilerpFloat(gridCornerY[0], gridCornerY[2], gridCornerY[1], gridCornerY[3], u, v);
+}
+
 // A cel (X,Y)-t a sarkok VALOS (nem kotelhossz-terbeli) koordinatai kozott
-// interpolaljuk linearisan, majd abbol szamoljuk a lepesszamokat
-// (xyToSteps) - igy a jog egyenes vonalat ir le, nem ivet.
+// interpolaljuk linearisan, majd abbol szamoljuk a lepesszamokat (xyToSteps).
 void gridTargetForUV(float u, float v, long &outA, long &outB) {
   if (!gridCornerXYValid) {
     // biztonsagi tartalek, ha meg nincs kesz mind a 4 sarok (elvileg ide nem
@@ -779,8 +809,8 @@ void gridTargetForUV(float u, float v, long &outA, long &outB) {
     outB = bilerpLong(gridCornerB[0], gridCornerB[2], gridCornerB[1], gridCornerB[3], u, v);
     return;
   }
-  float x = bilerpFloat(gridCornerX[0], gridCornerX[2], gridCornerX[1], gridCornerX[3], u, v);
-  float y = bilerpFloat(gridCornerY[0], gridCornerY[2], gridCornerY[1], gridCornerY[3], u, v);
+  float x, y;
+  gridUVToXY(u, v, x, y);
   xyToSteps(x, y, outA, outB);
 }
 
@@ -881,39 +911,60 @@ void jogMotorStop(FastAccelStepper *mot) {
 // ============ MOVE/CELLS JOG: kalibralt racs-terben, normalizalt (u,v) ============
 // M2: mindket motor a SAJAT delta-javal aranyos sebesseget ES gyorsulast
 // kap (nem csak a sebesseget) - igy v_A/a_A = v_B/a_B = v_max/a_max
-// mindket tengelyen, tehat a gyorsitasi/lassitasi ido (t=v/a) egyenlo,
-// a palya a MOZGAS TELJES IDOTARTAMA alatt egyenes vonalu marad, nem
-// csak az allando sebessegu szakaszban (H4/H6 javitasa).
-void moveJogApply(float u, float v) {
-  if (gridCornerMask != 0x0F || !motorA || !motorB) return;
-  long ta, tb;
-  gridTargetForUV(u, v, ta, tb);
-  long curA = motorA->getCurrentPosition(), curB = motorB->getCurrentPosition();
-  long dA = abs(ta - curA), dB = abs(tb - curB);
-  long dMax = max(dA, dB);
-  if (dMax == 0) return;
-  uint32_t vMax = mmSpeedToStepsHz(JOG_SPEED_MM_S);
-  uint32_t aMax = mmAccelToStepsS2(JOG_ACCEL_MM_S2);
-  uint32_t speedA = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dA) / (uint64_t)dMax));
-  uint32_t speedB = max(1UL, (unsigned long)(((uint64_t)vMax * (uint64_t)dB) / (uint64_t)dMax));
-  uint32_t accelA = max(1UL, (unsigned long)(((uint64_t)aMax * (uint64_t)dA) / (uint64_t)dMax));
-  uint32_t accelB = max(1UL, (unsigned long)(((uint64_t)aMax * (uint64_t)dB) / (uint64_t)dMax));
-  motorA->setSpeedInHz(speedA);
-  motorB->setSpeedInHz(speedB);
-  motorA->setAcceleration(accelA);
-  motorB->setAcceleration(accelB);
-  motorA->moveTo(ta);
-  motorB->moveTo(tb);
+// mindket tengelyen, tehat a gyorsitasi/lassitasi ido (t=v/a) egyenlo.
+// Ez onmagaban meg NEM eleg: egy tavoli celra torteno EGYETLEN, step-terben
+// egyenes mozgas a valos XY-sikban akkor is ivnek latszik, ha a cel maga
+// egy valodi XY-egyenesen van (a step<->XY lekepezes nemlinearis - ugyanaz
+// a jelenseg, mint a PLAY-mod moveToBlocking()-jaban, l. ott). Ezert a jog is
+// a VALODI XY-egyenes menten halad, JOG_SEGMENT_LEN_MM-es kozbenso pontokkal,
+// amiket replan-cikkusonkent (JOG_REPLAN_MS) egyesevel tovabb tolunk, amint a
+// motor eleg kozel ert az elozohoz - igy a nyomva tartas alatt a mozgas nem
+// all meg kozben, csak a celzott pont valik fokozatosan tavolabbivá.
+const float JOG_SEGMENT_LEN_MM = 3.0f;
+float jogLineStartX = 0, jogLineStartY = 0;
+float jogLineEndX = 0, jogLineEndY = 0;
+int jogSegIndex = 0, jogSegCount = 1;
+long jogAimA = 0, jogAimB = 0;
+
+void moveJogApply(float u, float v, bool startNewLine) {
+  if (gridCornerMask != 0x0F || !motorA || !motorB || !gridCornerXYValid) return;
+
+  if (startNewLine) {
+    // uj egyenes indul a motor TENYLEGES jelenlegi poziciojabol a tavoli
+    // celig - ez csak az iranyt/hosszat hatarozza meg, allapotot nem ir felul.
+    trilaterateSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), jogLineStartX, jogLineStartY);
+    gridUVToXY(u, v, jogLineEndX, jogLineEndY);
+    float dist = sqrt(sq(jogLineEndX - jogLineStartX) + sq(jogLineEndY - jogLineStartY));
+    jogSegCount = max(1, (int)ceil(dist / JOG_SEGMENT_LEN_MM));
+    jogSegIndex = 0;
+    jogAimA = motorA->getCurrentPosition();
+    jogAimB = motorB->getCurrentPosition();
+  }
+
+  if (jogSegIndex < jogSegCount &&
+      abs(jogAimA - motorA->getCurrentPosition()) <= PLAY_WAYPOINT_TOLERANCE_STEPS &&
+      abs(jogAimB - motorB->getCurrentPosition()) <= PLAY_WAYPOINT_TOLERANCE_STEPS) {
+    jogSegIndex++;
+    float t = (float)jogSegIndex / jogSegCount;
+    float ax = jogLineStartX + (jogLineEndX - jogLineStartX) * t;
+    float ay = jogLineStartY + (jogLineEndY - jogLineStartY) * t;
+    xyToSteps(ax, ay, jogAimA, jogAimB);
+  }
+
+  applyProportionalMove(jogAimA, jogAimB, JOG_SPEED_MM_S, JOG_ACCEL_MM_S2);
 }
 
 // A loop()-bol minden ciklusban hivva - amig LEFT/RIGHT/UP/DOWN nyomva van,
-// periodikusan (JOG_REPLAN_MS-enkent) ujratervezi a celt, MINDIG a motorok
-// TENYLEGES aktualis poziciojabol kiindulva (gridUVForSteps - M1/H5 javitas,
-// nem egy szabadon "elszaladhato" belso u/v valtozobol), egy rovid
-// "lookahead"-del a nyomott irany(ok)ba. Elengedeskor azonnal megallitja a
-// motort es szinkronizalja az allapotot a tenyleges pozicioval.
-float JOG_LOOKAHEAD = 0.02f; // a 0..1 racs-tartomany ennyi resze / ujratervezes
-unsigned long JOG_REPLAN_MS = 50;
+// periodikusan (JOG_REPLAN_MS-enkent) ujratervezi a celt: a nyomott
+// irany(ok)ban a racs SZELET (0.0/1.0) celozzuk meg, nem egy apro lepest -
+// igy a motor eleri es tartja a nevleges sebesseget a fogva tartas alatt
+// (nem all vissza folyamatosan gyorsulasi rampara, ami korabban a lassu
+// bepottyanast/ivelodest okozta). A nem hajtott tengely celja a PARANCSOLT
+// (moveU/moveV) ertek marad - sose a mozgas kozben mert poziciobol
+// ujraszamolt ertek, mert az a kotelhossz-interpolacio maradek-hibajat
+// minden replannal beleepitene az allapotba. Elengedeskor azonnal megallitja
+// a motort es szinkronizalja az allapotot a tenyleges pozicioval.
+unsigned long JOG_REPLAN_MS = 20;
 void updateMoveJogTick() {
   if (appMode != MODE_EDIT) return;
   if (editSubMode != EDIT_MOVE && editSubMode != EDIT_CELLS) return;
@@ -965,28 +1016,28 @@ void updateMoveJogTick() {
 
   unsigned long now = millis();
   if (jogWasActive && (now - lastReplanMs) < JOG_REPLAN_MS) return; // meg ne tervezzunk ujra
+  bool startNewLine = !jogWasActive; // friss gombnyomas - uj egyenest kell inditani a jelenlegi poziciobol
   lastReplanMs = now;
   jogWasActive = true;
 
-  // A bazis a PARANCSOLT (u,v), nem a mozgas kozben mert motorpozicio: a
-  // gridUVForSteps() maradekhibaja (Newton-tolerancia, constrain) kulonben
-  // minden replannal beleepulne a bazisba, es tiszta LEFT/RIGHT jognal a V
-  // iranyu hiba sose korrigalodna - ez volt a lassu sullyedes oka. A valos
-  // pozicioval csak nyugalmi allapotban hitelesitunk.
-  float curU = moveU, curV = moveV;
-  if (!motorA->isRunning() && !motorB->isRunning()) {
-    gridUVForSteps(motorA->getCurrentPosition(), motorB->getCurrentPosition(), curU, curV);
-  }
+  // alapertelmezesben a parancsolt U/V pozicio marad a cel
+  float tgtU = moveU;
+  float tgtV = moveV;
 
-  float tgtU = curU, tgtV = curV;
-  if (stableState[BTN8] == LOW) { tgtU -= JOG_LOOKAHEAD; drivenU = true; } // LEFT
-  if (stableState[BTN2] == LOW) { tgtU += JOG_LOOKAHEAD; drivenU = true; } // RIGHT
-  if (stableState[BTN4] == LOW) { tgtV -= JOG_LOOKAHEAD; drivenV = true; } // UP
-  if (stableState[BTN5] == LOW) { tgtV += JOG_LOOKAHEAD; drivenV = true; } // DOWN
-  tgtU = constrain(tgtU, 0.0f, 1.0f);
-  tgtV = constrain(tgtV, 0.0f, 1.0f);
-  moveU = tgtU; moveV = tgtV; // tajekoztato allapot (pl. MOVE ENTER log-jahoz)
-  moveJogApply(tgtU, tgtV);
+  if (stableState[BTN8] == LOW) { tgtU = 0.0f; drivenU = true; } // LEFT
+  if (stableState[BTN2] == LOW) { tgtU = 1.0f; drivenU = true; } // RIGHT
+  if (stableState[BTN4] == LOW) { tgtV = 0.0f; drivenV = true; } // UP
+  if (stableState[BTN5] == LOW) { tgtV = 1.0f; drivenV = true; } // DOWN
+
+  // ha nyomva tartas kozben valtozik a celzott irany (pl. uj tengely is
+  // csatlakozik), az is uj egyenest igenyel, kulonben a regi vonal menten
+  // haladna tovabb a mar ervenytelen celhoz.
+  static float lastTgtU = -999.0f, lastTgtV = -999.0f;
+  if (tgtU != lastTgtU || tgtV != lastTgtV) startNewLine = true;
+  lastTgtU = tgtU;
+  lastTgtV = tgtV;
+
+  moveJogApply(tgtU, tgtV, startNewLine);
 }
 
 // Az EDIT menu SETUP-belepes (3-as gomb 1x) fuggoben tartasat zarja le, ha
@@ -1389,27 +1440,24 @@ String cmdClearCells() {
   return "OK: minden cella torolve, formatum ujrainicializalva (v" + String(CELL_FORMAT_VERSION) + ")";
 }
 
-// setSpeed JOG_SPEED_MM_S,JOG_ACCEL_MM_S2,JOG_REPLAN_MS,JOG_LOOKAHEAD - pl. 40.00,250.00,50,0.02
+// setSpeed JOG_SPEED_MM_S,JOG_ACCEL_MM_S2,JOG_REPLAN_MS - pl. 40.00,250.00,20
 String cmdSetSpeed(const String &args) {
   int pos = 0;
   String speedStr = splitToken(args, pos, ',');
   String accelStr = splitToken(args, pos, ',');
-  String replanStr = splitToken(args, pos, ',');
-  String lookaheadStr = args.substring(pos);
-  if (speedStr.length() == 0 || accelStr.length() == 0 || replanStr.length() == 0 || lookaheadStr.length() == 0) {
-    return "HIBA: setSpeed formatum: SPEED_MM_S,ACCEL_MM_S2,REPLAN_MS,LOOKAHEAD";
+  String replanStr = args.substring(pos);
+  if (speedStr.length() == 0 || accelStr.length() == 0 || replanStr.length() == 0) {
+    return "HIBA: setSpeed formatum: SPEED_MM_S,ACCEL_MM_S2,REPLAN_MS";
   }
   float speed = speedStr.toFloat();
   float accel = accelStr.toFloat();
   long replan = replanStr.toInt();
-  float lookahead = lookaheadStr.toFloat();
-  if (speed <= 0 || accel <= 0 || replan <= 0 || lookahead <= 0) return "HIBA: minden ertek pozitiv kell legyen";
+  if (speed <= 0 || accel <= 0 || replan <= 0) return "HIBA: minden ertek pozitiv kell legyen";
   JOG_SPEED_MM_S = speed;
   JOG_ACCEL_MM_S2 = accel;
   JOG_REPLAN_MS = (unsigned long)replan;
-  JOG_LOOKAHEAD = lookahead;
   return "OK: JOG_SPEED_MM_S=" + String(JOG_SPEED_MM_S, 2) + " JOG_ACCEL_MM_S2=" + String(JOG_ACCEL_MM_S2, 2) +
-         " JOG_REPLAN_MS=" + String(JOG_REPLAN_MS) + " JOG_LOOKAHEAD=" + String(JOG_LOOKAHEAD, 2);
+         " JOG_REPLAN_MS=" + String(JOG_REPLAN_MS);
 }
 
 // M5.1: diagnosztikai lenyomat mindenrol, amit a MOVE/CELLS geometria hasznal -
