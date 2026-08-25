@@ -72,8 +72,8 @@ unsigned long pendingSetupCornerTime = 0;
 // ============ GÉP GEOMETRIA ============
 // Merve: origo (0,0)-ban a kotelhossz A-n 260mm, B-n 780mm - ebbol vissza-
 // szamolva a horgonypoziciok (a korabbi -200/-200 es 920/-200 becslesek voltak).
-const float ANCHOR_A_X = -155.0, ANCHOR_A_Y = -205.0;
-const float ANCHOR_B_X =  755.0, ANCHOR_B_Y = -205.0;
+const float ANCHOR_A_X = -148.0, ANCHOR_A_Y = -210.0;
+const float ANCHOR_B_X =  756.0, ANCHOR_B_Y = -210.0;
 // Origoban (0,0) mert kotelhosszak - ezek a hiteles referenciak, nem az
 // ANCHOR_A/B-bol computeStringLengths()-szel visszaszamolt (kozelito) ertekek.
 const float ORIGIN_LEN_A_MM = 260.0;
