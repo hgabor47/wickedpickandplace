@@ -76,8 +76,8 @@ const float ANCHOR_A_X = -148.0, ANCHOR_A_Y = -210.0;
 const float ANCHOR_B_X =  756.0, ANCHOR_B_Y = -210.0;
 // Origoban (0,0) mert kotelhosszak - ezek a hiteles referenciak, nem az
 // ANCHOR_A/B-bol computeStringLengths()-szel visszaszamolt (kozelito) ertekek.
-const float ORIGIN_LEN_A_MM = 260.0;
-const float ORIGIN_LEN_B_MM = 780.0;
+const float ORIGIN_LEN_A_MM = 170.0; //266.0;
+const float ORIGIN_LEN_B_MM = 700.0; // 786.0;
 // A kulissza (gondola) egy szabadon forgo korong: a ket fonal nem a kozeppontban,
 // hanem a keruleten, a korong sajat "felfele" jelehez kepest -/+45 fokban van
 // rogzitve. A korong elfordulasi szoge (theta) helyzetfuggo, statikai
@@ -524,11 +524,11 @@ void applyProportionalMove(long targetA, long targetB, float speedMmPerSec, floa
 // interpolacio hosszu tavon a valos XY-sikban ivnek latszana (a trilateracios
 // step<->XY lekepezes nemlinearis), ezert a VALODI XY-egyenes menten
 // szamolunk kozbenso pontokat.
-const float PLAY_SEGMENT_LEN_MM = 3.0f;
+const float PLAY_SEGMENT_LEN_MM = 10.0f;
 // Kozbenso szegmensnel ennyire kell csak megkozeliteni a celt ahhoz, hogy a
 // kovetkezo szegmensre valthassunk - igy a motor nem all meg teljesen minden
 // waypointnal, csak a mozgas legvegen (a valodi celnal).
-const long PLAY_WAYPOINT_TOLERANCE_STEPS = 3;
+const long PLAY_WAYPOINT_TOLERANCE_STEPS = 60;
 
 // Csak a Core0-motionExecTask hívja - itt a blokkolás nem gond, mert ez a mag
 // KIZÁRÓLAG ezt csinálja, a gombolvasás/webszerver a másik magon fut tovább.
