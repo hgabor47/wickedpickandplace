@@ -635,42 +635,13 @@ bool gridCornerXYValid = false;
 
 float moveU = 0.5f, moveV = 0.5f; // MOVE/CELLS almod aktualis normalizalt (0..1) pozicioja
 
-// ---- M3-C: auto-kalibracio (legkisebb negyzetek) allapota ----
-// A felhasznalo lemeri a valos munkaterulet meretet ("setArea" parancs),
-// a SETUP pedig pontosan a 4 sarokra all - ebbol Gauss-Newton iteracioval
-// visszaszamoljuk a 2 horgony VALODI (X,Y) helyet + egy step->mm eltolast
-// horgonyonkent (calOffA/B), igy nem kell a horgonyt fizikailag lemerni.
-// Amig nincs ervenyes auto-kalibracio (calValid==false), a rendszer a
-// regi, hardkodolt ANCHOR_A/B allandokra esik vissza (0 eltolassal).
-float workAreaXMax = 0, workAreaYMax = 0;
-float calAx = ANCHOR_A_X, calAy = ANCHOR_A_Y;
-float calBx = ANCHOR_B_X, calBy = ANCHOR_B_Y;
-float calOffAmm = 0, calOffBmm = 0;
-bool calValid = false;
-
-void saveCalibration() {
-  prefs.putFloat("calAx", calAx);
-  prefs.putFloat("calAy", calAy);
-  prefs.putFloat("calBx", calBx);
-  prefs.putFloat("calBy", calBy);
-  prefs.putFloat("calOffA", calOffAmm);
-  prefs.putFloat("calOffB", calOffBmm);
-  prefs.putUChar("calValid", calValid ? 1 : 0);
-  prefs.putFloat("areaXMax", workAreaXMax);
-  prefs.putFloat("areaYMax", workAreaYMax);
-}
-
-void loadCalibration() {
-  calAx = prefs.getFloat("calAx", ANCHOR_A_X);
-  calAy = prefs.getFloat("calAy", ANCHOR_A_Y);
-  calBx = prefs.getFloat("calBx", ANCHOR_B_X);
-  calBy = prefs.getFloat("calBy", ANCHOR_B_Y);
-  calOffAmm = prefs.getFloat("calOffA", 0);
-  calOffBmm = prefs.getFloat("calOffB", 0);
-  calValid = prefs.getUChar("calValid", 0) != 0;
-  workAreaXMax = prefs.getFloat("areaXMax", 0);
-  workAreaYMax = prefs.getFloat("areaYMax", 0);
-}
+// A horgonyok (ANCHOR_A/B) fix, kezzel megmert/becsult konstansok - nincs
+// automatikus horgony-illesztes (az korabban instabil volt: a horgonypoziciot
+// es a step->mm eltolast egyutt oldva a legkisebb negyzetek konnyen egy
+// fizikailag ertelmetlen, tavoli megoldasba futott). A pontatlan kezi SETUP
+// sarok-bemerest a gridTargetForUV()/gridUVForSteps() bilinearis interpolacioja
+// kezeli (a VALODI, trilateracioval visszaszamolt sarok-negyszogon dolgozik),
+// nem egy elmeleti tokeletes teglalapra kenyszeritve az adatokat.
 
 void saveGridCorners() {
   prefs.putBytes("gridCornA", gridCornerA, sizeof(gridCornerA));
@@ -710,8 +681,7 @@ float bilerpFloat(float v00, float v10, float v01, float v11, float u, float v) 
 
 // Ket kor (ax,ay es bx,by kozeppontal, lenA/lenB sugarral) metszespontjabol
 // azt az (X,Y)-t adja vissza, amelyik a horgonyok "alatt" van (nagyobb Y).
-// Altalanos valtozat (nem hardkodolt ANCHOR_A/B-re), mert a kalibralt
-// horgonypoziciok (calAx/calAy/calBx/calBy) is ugyanezt hasznaljak.
+// Altalanos valtozat, bar jelenleg mindig a fix ANCHOR_A/B-vel hivjuk.
 bool circleIntersectBelow(float ax, float ay, float bx, float by,
                            float lenA, float lenB, float &outX, float &outY) {
   float dx = bx - ax, dy = by - ay;
@@ -732,34 +702,23 @@ bool circleIntersectBelow(float ax, float ay, float bx, float by,
   return true;
 }
 
-// step-parbol (motorA/motorB nyers pozicio) valodi (X,Y)-t szamol - a
-// kalibralt horgonypoziciokat/eltolasokat hasznalja, ha van ervenyes
-// auto-kalibracio (calValid), kulonben a regi hardkodolt ANCHOR_A/B-re
-// esik vissza (0 eltolassal) - ez az EGYETLEN hely, ahol step->(X,Y)
-// tortenik az EDIT-mod racs-rendszereben (M1: egyetlen igazsagforras).
+// step-parbol (motorA/motorB nyers pozicio) valodi (X,Y)-t szamol - fix,
+// kezzel megmert ANCHOR_A/B horgonypoziciokat hasznalja (nincs horgony-
+// illesztes/eltolas) - ez az EGYETLEN hely, ahol step->(X,Y) tortenik az
+// EDIT-mod racs-rendszereben (M1: egyetlen igazsagforras).
 bool trilaterateSteps(long stepsA, long stepsB, float &outX, float &outY) {
-  float ax = calValid ? calAx : (float)ANCHOR_A_X;
-  float ay = calValid ? calAy : (float)ANCHOR_A_Y;
-  float bx = calValid ? calBx : (float)ANCHOR_B_X;
-  float by = calValid ? calBy : (float)ANCHOR_B_Y;
-  float lenA = stepsA / STEPS_PER_MM + (calValid ? calOffAmm : 0.0f);
-  float lenB = stepsB / STEPS_PER_MM + (calValid ? calOffBmm : 0.0f);
-  return circleIntersectBelow(ax, ay, bx, by, lenA, lenB, outX, outY);
+  float lenA = stepsA / STEPS_PER_MM;
+  float lenB = stepsB / STEPS_PER_MM;
+  return circleIntersectBelow(ANCHOR_A_X, ANCHOR_A_Y, ANCHOR_B_X, ANCHOR_B_Y, lenA, lenB, outX, outY);
 }
 
-// (X,Y) -> step-par, a trilaterateSteps() inverze - ugyanazokat a kalibralt
-// horgonypoziciokat/eltolasokat hasznalja, mint trilaterateSteps().
+// (X,Y) -> step-par, a trilaterateSteps() inverze - ugyanazt a fix ANCHOR_A/B-t
+// hasznalja, mint trilaterateSteps().
 void xyToSteps(float x, float y, long &outA, long &outB) {
-  float ax = calValid ? calAx : (float)ANCHOR_A_X;
-  float ay = calValid ? calAy : (float)ANCHOR_A_Y;
-  float bx = calValid ? calBx : (float)ANCHOR_B_X;
-  float by = calValid ? calBy : (float)ANCHOR_B_Y;
-  float offA = calValid ? calOffAmm : 0.0f;
-  float offB = calValid ? calOffBmm : 0.0f;
-  float lenA = sqrt(sq(x - ax) + sq(y - ay));
-  float lenB = sqrt(sq(x - bx) + sq(y - by));
-  outA = mmToSteps(lenA - offA);
-  outB = mmToSteps(lenB - offB);
+  float lenA = sqrt(sq(x - ANCHOR_A_X) + sq(y - ANCHOR_A_Y));
+  float lenB = sqrt(sq(x - ANCHOR_B_X) + sq(y - ANCHOR_B_Y));
+  outA = mmToSteps(lenA);
+  outB = mmToSteps(lenB);
 }
 
 // M4: ellenorzi, hogy a 4 szamolt sarok (X,Y) egy ertelmes, konvex
@@ -794,7 +753,7 @@ void computeGridCornerXY() {
   }
   if (gridCornerXYValid && !cornersFormReasonableRect()) {
     gridCornerXYValid = false;
-    webLog("SETUP: HIBA - a szamitott sarok-negyszog ertelmetlen (nem konvex vagy elfajult). Ellenorizd a SETUP sarkokat / futtass setArea-t.");
+    webLog("SETUP: HIBA - a szamitott sarok-negyszog ertelmetlen (nem konvex vagy elfajult). Ellenorizd a SETUP sarkokat / az ANCHOR_A/B allandokat.");
   }
 }
 
@@ -862,150 +821,6 @@ void syncStateFromMotors() {
   if (gridUVForSteps(a, b, u, v)) {
     moveU = u; moveV = v;
   }
-}
-
-// ---- M3-C: 6x6 linearis egyenletrendszer megoldasa Gauss-eliminacioval
-// (reszleges pivotalassal) - a Gauss-Newton legkisebb negyzetek lepeséhez. ----
-bool solveLinear6(double A[6][6], double *b, double *x) {
-  double M[6][7];
-  for (int i = 0; i < 6; i++) {
-    for (int j = 0; j < 6; j++) M[i][j] = A[i][j];
-    M[i][6] = b[i];
-  }
-  for (int col = 0; col < 6; col++) {
-    int piv = col;
-    double best = fabs(M[col][col]);
-    for (int r = col + 1; r < 6; r++) {
-      if (fabs(M[r][col]) > best) { best = fabs(M[r][col]); piv = r; }
-    }
-    if (best < 1e-9) return false;
-    if (piv != col) {
-      for (int c = 0; c <= 6; c++) {
-        double tmp = M[col][c]; M[col][c] = M[piv][c]; M[piv][c] = tmp;
-      }
-    }
-    for (int r = 0; r < 6; r++) {
-      if (r == col) continue;
-      double f = M[r][col] / M[col][col];
-      for (int c = col; c <= 6; c++) M[r][c] -= f * M[col][c];
-    }
-  }
-  for (int i = 0; i < 6; i++) x[i] = M[i][6] / M[i][i];
-  return true;
-}
-
-// Auto-kalibracio (M3, "C" valtozat): a 4 SETUP-sarok mert lepesszamaibol
-// es a felhasznalo altal megadott valos munkaterulet-meretbol (workAreaXMax/
-// YMax, lasd "setArea" parancs) Levenberg-Marquardt legkisebb negyzetekkel
-// visszaszamolja a 2 horgony VALODI (X,Y) helyet + egy step->mm eltolast
-// horgonyonkent (6 ismeretlen: ax,ay,bx,by,offA,offB; 8 egyenlet: 4 sarok x
-// 2 horgony-tavolsag). Numerikus (veges differencia) Jacobi-matrixot hasznal.
-// A "sima" Gauss-Newton (damping nelkul) egy rossz kezdeti becslesnel (pl. a
-// hardkodolt ANCHOR_A/B nagyon tavol van a valos horgonytol) konnyen
-// szingularis normalegyenletekhez / divergenciahoz vezetett - LM-damping-gel
-// ez robusztus marad, es minden sikertelen esetben logol, hogy miert.
-bool runAutoCalibration() {
-  if (gridCornerMask != 0x0F || workAreaXMax <= 0 || workAreaYMax <= 0) return false;
-
-  // sarokindex: 0=(0,0) 1=(0,YMAX) 2=(XMAX,0) 3=(XMAX,YMAX)
-  float cornerRealX[4] = {0, 0, workAreaXMax, workAreaXMax};
-  float cornerRealY[4] = {0, workAreaYMax, 0, workAreaYMax};
-
-  // Kezdeti becsles: a hardkodolt ANCHOR_A/B alakja/aranya, de a munkaterulet
-  // kozepere igazitva (X-ben), hogy koveto legyen a valos meretekhez - ez
-  // sokkal jobb induloertek, mint a nyers ANCHOR_A/B konstansok, ha a
-  // munkaterulet merete tavol esik azoktol.
-  double p[6] = { -workAreaXMax * 0.15, -workAreaYMax * 0.15,
-                  workAreaXMax * 1.15,  -workAreaYMax * 0.15,
-                  0.0, 0.0 };
-
-  auto residuals = [&](double *pp, double *r) {
-    for (int i = 0; i < 4; i++) {
-      double lenA = gridCornerA[i] / (double)STEPS_PER_MM + pp[4];
-      double lenB = gridCornerB[i] / (double)STEPS_PER_MM + pp[5];
-      double dA = sqrt(sq(cornerRealX[i] - pp[0]) + sq(cornerRealY[i] - pp[1])) - lenA;
-      double dB = sqrt(sq(cornerRealX[i] - pp[2]) + sq(cornerRealY[i] - pp[3])) - lenB;
-      r[i * 2 + 0] = dA;
-      r[i * 2 + 1] = dB;
-    }
-  };
-  auto costOf = [](double *r) {
-    double s = 0;
-    for (int i = 0; i < 8; i++) s += r[i] * r[i];
-    return s;
-  };
-
-  double r0[8], rP[8], rTrial[8];
-  residuals(p, r0);
-  double bestCost = costOf(r0);
-  double lambda = 1e-3;
-  int iter;
-  for (iter = 0; iter < 60; iter++) {
-    residuals(p, r0);
-    double J[8][6];
-    for (int k = 0; k < 6; k++) {
-      double saved = p[k];
-      double h = (k < 4) ? 0.5 : 0.1; // mm-lepes a numerikus derivalthoz
-      p[k] = saved + h;
-      residuals(p, rP);
-      p[k] = saved;
-      for (int i = 0; i < 8; i++) J[i][k] = (rP[i] - r0[i]) / h;
-    }
-    double JTJ[6][6] = {{0}};
-    double JTr[6] = {0};
-    for (int a = 0; a < 6; a++) {
-      for (int b = 0; b < 6; b++) {
-        double s = 0;
-        for (int i = 0; i < 8; i++) s += J[i][a] * J[i][b];
-        JTJ[a][b] = s;
-      }
-      double s = 0;
-      for (int i = 0; i < 8; i++) s += J[i][a] * r0[i];
-      JTr[a] = -s;
-    }
-    // LM-damping: a fodiagonalist (1+lambda)-szorosara novelve mindig
-    // szabalyos (nem szingularis) marad a normalegyenlet-rendszer.
-    double JTJd[6][6];
-    for (int a = 0; a < 6; a++) {
-      for (int b = 0; b < 6; b++) JTJd[a][b] = JTJ[a][b];
-      JTJd[a][a] = JTJ[a][a] * (1.0 + lambda) + 1e-9;
-    }
-    double dp[6] = {0};
-    if (!solveLinear6(JTJd, JTr, dp)) {
-      lambda *= 10.0;
-      if (lambda > 1e8) { webLog("AUTOKAL: HIBA - a normalegyenlet szingularis marad, feladva."); return false; }
-      continue;
-    }
-    double pTrial[6];
-    for (int k = 0; k < 6; k++) pTrial[k] = p[k] + dp[k];
-    residuals(pTrial, rTrial);
-    double trialCost = costOf(rTrial);
-    if (trialCost < bestCost) {
-      for (int k = 0; k < 6; k++) p[k] = pTrial[k];
-      bool converged = (bestCost - trialCost) < 1e-6 * (bestCost + 1e-9);
-      bestCost = trialCost;
-      lambda = max(lambda * 0.3, 1e-8);
-      if (converged) { iter++; break; }
-    } else {
-      lambda *= 4.0;
-      if (lambda > 1e8) { webLog("AUTOKAL: HIBA - nem sikerult javitani a hibat, feladva."); return false; }
-    }
-  }
-
-  residuals(p, r0);
-  double rmsErrorMm = sqrt(costOf(r0) / 8.0);
-  webLogf("AUTOKAL: %d iteracio, RMS hiba = %.2f mm (A=%.1f,%.1f B=%.1f,%.1f offA=%.2f offB=%.2f)",
-          iter, rmsErrorMm, p[0], p[1], p[2], p[3], p[4], p[5]);
-  if (rmsErrorMm > 5.0) {
-    webLog("AUTOKAL: HIBA - a maradek hiba tul nagy (>5mm), a kalibracio elutasitva.");
-    return false;
-  }
-  calAx = (float)p[0]; calAy = (float)p[1];
-  calBx = (float)p[2]; calBy = (float)p[3];
-  calOffAmm = (float)p[4]; calOffBmm = (float)p[5];
-  calValid = true;
-  saveCalibration();
-  return true;
 }
 
 void computeDefaultGridCells() {
@@ -1150,15 +965,6 @@ void storeCorner(int cornerIdx, const char *label) {
   webLogf("SETUP: sarok '%s' tarolva (A=%ld, B=%ld)", label, gridCornerA[cornerIdx], gridCornerB[cornerIdx]);
   ackRight(1);
   if (gridCornerMask == 0x0F) {
-    // M3-C: ha mar ismert a valos munkaterulet merete (setArea parancs),
-    // most probaljuk auto-kalibralni a horgonyokat legkisebb negyzetekkel.
-    if (workAreaXMax > 0 && workAreaYMax > 0) {
-      if (!runAutoCalibration()) {
-        webLog("SETUP: AUTOKAL sikertelen - a regi, nem kalibralt horgonybecslest hasznaljuk (lasd fenti log).");
-      }
-    } else {
-      webLog("SETUP: nincs meg 'setArea' parancs kiadva - AUTOKAL kimarad, kesobb (setArea utan) is lefuthat.");
-    }
     computeGridCornerXY();
     computeDefaultGridCells();
     syncStateFromMotors();
@@ -1250,7 +1056,7 @@ void cellsHandleRelease(int i) {
 // hogy ne lehessen ervenytelen geometrian jogolni. PATH nem igenyli.
 void enterEditSubMode(EditSubMode m, const char *name) {
   if ((m == EDIT_MOVE || m == EDIT_CELLS) && !gridCornerXYValid) {
-    webLogf("EDIT: '%s' almod elutasitva - nincs ervenyes racs-kalibracio (fejezd be a SETUP-ot / futtasd le a setArea-t).", name);
+    webLogf("EDIT: '%s' almod elutasitva - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).", name);
     return;
   }
   editSubMode = m;
@@ -1510,35 +1316,6 @@ String cmdClearCells() {
   return "OK: minden cella torolve, formatum ujrainicializalva (v" + String(CELL_FORMAT_VERSION) + ")";
 }
 
-// M3-C: a valos munkaterulet merete (mm) - a SETUP 4 sarkaval egyutt ez adja
-// az auto-kalibracio bemenetet. Barmikor kiadhato (SETUP elott vagy utan is);
-// ha a SETUP mar kesz, azonnal ujra lefuttatja a kalibraciot es a racsot.
-String cmdSetArea(const String &args) {
-  int pos = 0;
-  String xStr = splitToken(args, pos, ',');
-  String yStr = args.substring(pos);
-  if (xStr.length() == 0 || yStr.length() == 0) return "HIBA: setArea formatum: XMAX,YMAX (mm)";
-  float xmax = xStr.toFloat(), ymax = yStr.toFloat();
-  if (xmax <= 0 || ymax <= 0) return "HIBA: XMAX,YMAX pozitiv legyen (mm)";
-  workAreaXMax = xmax;
-  workAreaYMax = ymax;
-  saveCalibration();
-  String result = "OK: munkaterulet = " + String(xmax, 1) + " x " + String(ymax, 1) + " mm";
-  if (gridCornerMask == 0x0F) {
-    if (runAutoCalibration()) {
-      computeGridCornerXY();
-      computeDefaultGridCells();
-      syncStateFromMotors();
-      result += " - AUTOKAL sikeres, racs ujraszamolva.";
-    } else {
-      result += " - AUTOKAL sikertelen (lasd log), a regi kalibraciot hasznaljuk.";
-    }
-  } else {
-    result += " - meg hianyzik SETUP sarok, AUTOKAL kesobb (a 4. sarok mentesekor) fut le.";
-  }
-  return result;
-}
-
 // M5.1: diagnosztikai lenyomat mindenrol, amit a MOVE/CELLS geometria hasznal -
 // gyors hibakereseshez (nem kell ujra beeploidolni logolashoz).
 String cmdGeom() {
@@ -1553,11 +1330,8 @@ String cmdGeom() {
     out += "corner" + String(i) + ": A=" + String(gridCornerA[i]) + " B=" + String(gridCornerB[i]) +
            " X=" + String(gridCornerX[i], 2) + " Y=" + String(gridCornerY[i], 2) + "\n";
   }
-  out += "calValid=" + String(calValid ? 1 : 0) +
-         " calAx=" + String(calAx, 2) + " calAy=" + String(calAy, 2) +
-         " calBx=" + String(calBx, 2) + " calBy=" + String(calBy, 2) +
-         " calOffA=" + String(calOffAmm, 3) + " calOffB=" + String(calOffBmm, 3) + "\n";
-  out += "workAreaXMax=" + String(workAreaXMax, 1) + " workAreaYMax=" + String(workAreaYMax, 1) + "\n";
+  out += "ANCHOR_A=(" + String(ANCHOR_A_X, 1) + "," + String(ANCHOR_A_Y, 1) + ") ANCHOR_B=(" +
+         String(ANCHOR_B_X, 1) + "," + String(ANCHOR_B_Y, 1) + ")\n";
   out += "STEPS_PER_MM=" + String(STEPS_PER_MM, 4) + " MICROSTEPPING=" + String(MICROSTEPPING, 0) + "\n";
   return out;
 }
@@ -1577,7 +1351,6 @@ String executeCommandLine(String line) {
   if (cmd == "testMagnet")   return cmdTestMagnet(args);
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
-  if (cmd == "setArea")      return cmdSetArea(args);
   if (cmd == "geom")         return cmdGeom();
   return "HIBA: ismeretlen parancs: " + cmd;
 }
@@ -1629,12 +1402,11 @@ void setup() {
     loadAllCells();
   }
 
-  loadCalibration();
   loadGridCorners();
   loadGridCells();
   computeGridCornerXY();
-  webLogf("EDIT kalibracio: sarkak=%d/4, cellaracs=%s, autokal=%s", __builtin_popcount(gridCornerMask),
-          gridCellsComputed ? "betoltve" : "nincs", calValid ? "ervenyes" : "nincs");
+  webLogf("EDIT kalibracio: sarkak=%d/4, cellaracs=%s", __builtin_popcount(gridCornerMask),
+          gridCellsComputed ? "betoltve" : "nincs");
 
   // ---- Mozgas-queue ----
   motionQueue = xQueueCreate(MOTION_QUEUE_LEN, sizeof(QueueItem));
