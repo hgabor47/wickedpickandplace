@@ -254,7 +254,7 @@ int findAvailableCellByCode(const String &code) {
 }
 
 // ============ MOZGÁS-QUEUE (Core0 fogyasztja) ============
-enum QueueItemKind : uint8_t { QI_SEQUENCE = 0, QI_MOTOR_TEST = 1, QI_MAGNET_TEST = 2 };
+enum QueueItemKind : uint8_t { QI_SEQUENCE = 0, QI_MOTOR_TEST = 1, QI_MAGNET_TEST = 2, QI_SHOWCELLS = 3 };
 
 struct QueueItem {
   QueueItemKind kind;
@@ -524,7 +524,11 @@ void applyProportionalMove(long targetA, long targetB, float speedMmPerSec, floa
 // interpolacio hosszu tavon a valos XY-sikban ivnek latszana (a trilateracios
 // step<->XY lekepezes nemlinearis), ezert a VALODI XY-egyenes menten
 // szamolunk kozbenso pontokat.
-const float PLAY_SEGMENT_LEN_MM = 10.0f;
+// M6: ugyanaz a hossz, mint JOG_SEGMENT_LEN_MM - igy a tolerancia (lasd lejjebb)
+// nagyobb marad a szegmenshossznal, es a motor sose fekezik le teljesen egy-egy
+// kozbenso waypointnal (korabban 10mm-es szegmenssel a fekezes/ujragyorsulas
+// dodogo, "nyogvenyelos" mozgast okozott).
+const float PLAY_SEGMENT_LEN_MM = 3.0f;
 // Kozbenso szegmensnel ennyire kell csak megkozeliteni a celt ahhoz, hogy a
 // kovetkezo szegmensre valthassunk - igy a motor nem all meg teljesen minden
 // waypointnal, csak a mozgas legvegen (a valodi celnal).
@@ -673,6 +677,10 @@ void executeMagnetTest(const QueueItem &item) {
   ledcWrite(PWM_CHANNEL, 0);
 }
 
+// Definialva lejjebb, a racs-kalibracios (GRID_COLS/gridCellA/B) szekcio utan -
+// itt csak a motionExecTask dispatch-hez kell a prototipus.
+void executeShowCells();
+
 void motionExecTask(void *parameter) {
   QueueItem item;
   for (;;) {
@@ -682,6 +690,7 @@ void motionExecTask(void *parameter) {
         case QI_SEQUENCE:    executeQueueSequence(item); break;
         case QI_MOTOR_TEST:  executeMotorTest(item);     break;
         case QI_MAGNET_TEST: executeMagnetTest(item);    break;
+        case QI_SHOWCELLS:   executeShowCells();          break;
       }
       webLogf("Vegrehajtva. Pufferben meg: %d elem.", (int)uxQueueMessagesWaiting(motionQueue));
     }
@@ -1074,16 +1083,47 @@ void syncStateFromMotors() {
 }
 
 void computeDefaultGridCells() {
+  // Sarok-illeszkedo racs: col=0/row=0 pontosan a (0,0) sarokra esik, col=GRID_COLS-1/
+  // row=GRID_ROWS-1 pontosan a szemkozti sarokra - NEM cella-kozep-inset (ami felcellanyit
+  // beljebb tolna az elso/utolso oszlopot/sort, kb 40mm-es "csuszast" okozva a szeleken).
   for (int row = 0; row < GRID_ROWS; row++) {
     for (int col = 0; col < GRID_COLS; col++) {
-      float u = (col + 0.5f) / GRID_COLS;
-      float v = (row + 0.5f) / GRID_ROWS;
+      float u = (GRID_COLS > 1) ? (float)col / (GRID_COLS - 1) : 0.5f;
+      float v = (GRID_ROWS > 1) ? (float)row / (GRID_ROWS - 1) : 0.5f;
       int idx = row * GRID_COLS + col;
       gridTargetForUV(u, v, gridCellA[idx], gridCellB[idx]);
     }
   }
   gridCellsComputed = true;
   saveGridCells();
+}
+
+// ============ SHOWCELLS: automatikus cellabejaras (BTN6 az EDIT_MENU-ben) ============
+// A gridCellA/B mar sor-major (idx = row*GRID_COLS+col) sorrendben van feltoltve,
+// igy a novekvo idx bejaras onmagaban Z-alaku (soronkent balrol jobbra, majd a
+// kovetkezo sor elejere ugorva) - nincs szukseg kulon kigyozo (serpentine) logikara.
+const unsigned long SHOWCELLS_DWELL_MS = 1000;
+
+void executeShowCells() {
+  if (!gridCornerXYValid) {
+    webLog("SHOWCELLS: HIBA - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).");
+    return;
+  }
+  webLog("SHOWCELLS: cellabejaras inditva (0..34).");
+  for (int idx = 0; idx < GRID_CELL_COUNT; idx++) {
+    float x, y;
+    if (!trilaterateSteps(gridCellA[idx], gridCellB[idx], x, y)) {
+      webLogf("SHOWCELLS: cella #%d (sor %d, oszlop %d) step->XY hiba, kihagyva.",
+              idx, idx / GRID_COLS, idx % GRID_COLS);
+      continue;
+    }
+    moveToBlocking(x, y, SPEED_TRAVEL);
+    webLogf("SHOWCELLS: cella #%d (sor %d, oszlop %d) elerve.",
+            idx, idx / GRID_COLS, idx % GRID_COLS);
+    delay(SHOWCELLS_DWELL_MS);
+  }
+  syncStateFromMotors();
+  webLog("SHOWCELLS: bejaras kesz (35/35 cella).");
 }
 
 // ============ ACK VISSZAJELZES: motor oda-vissza mozgatas gombnyomasra ============
@@ -1456,6 +1496,21 @@ void onButtonPressed(int i) {
       case BTN1: enterEditSubMode(EDIT_PATH,   "PATH");   break;
       case BTN2: enterEditSubMode(EDIT_CELLS,  "CELLS");  break;
       case BTN8: enterEditSubMode(EDIT_MOVE,   "MOVE");   break;
+      case BTN6: {
+        if (!gridCornerXYValid) {
+          webLog("SHOWCELLS: elutasitva - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).");
+          break;
+        }
+        QueueItem item = {};
+        item.kind = QI_SHOWCELLS;
+        if (xQueueSend(motionQueue, &item, 0) != pdTRUE) {
+          webLog("SHOWCELLS: HIBA - mozgas-puffer tele.");
+        } else {
+          webLog("SHOWCELLS: bejaras sorba allitva.");
+          ackRight(2);
+        }
+        break;
+      }
       default: break;
     }
     return;
