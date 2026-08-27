@@ -756,6 +756,11 @@ long gridCellA[GRID_CELL_COUNT] = {0};
 long gridCellB[GRID_CELL_COUNT] = {0};
 bool gridCellsComputed = false;
 
+// M7: oszloponkenti Y-eltolas szazalekban (pozitiv = lejjebb/nagyobb Y, negativ = feljebb) -
+// a sor-lepeskoz (egy cellasor Y-tavolsaganak) szazalekaban ertelmezve, lasd computeDefaultGridCells().
+// col index: 0..GRID_COLS-1, balrol jobbra.
+const float COL_Y_COMP_PERCENT[GRID_COLS] = { 5.0f, 3.0f, 0.0f, -3.0f, 0.0f, 3.0f, 5.0f };
+
 // A 4 sarok VALODI (X,Y) helye (trilateracioval szamolva a sarkok mert
 // kotelhosszaibol) - ez kell ahhoz, hogy a soron kovetkezo interpolacio a
 // valos sikban legyen linearis (egyenes vonalu), ne a kotelhossz-terben
@@ -1086,10 +1091,16 @@ void computeDefaultGridCells() {
   // Sarok-illeszkedo racs: col=0/row=0 pontosan a (0,0) sarokra esik, col=GRID_COLS-1/
   // row=GRID_ROWS-1 pontosan a szemkozti sarokra - NEM cella-kozep-inset (ami felcellanyit
   // beljebb tolna az elso/utolso oszlopot/sort, kb 40mm-es "csuszast" okozva a szeleken).
+  // M7: oszloponkenti Y-korrekcio (mert-tapasztalati) - a naiv bilinearis interpolaciotol
+  // szisztematikusan elter (pl. kotel-athajlas), ezert egy oszloponkenti V-eltolast
+  // adunk hozza, a sor-lepeskoz (1/(GRID_ROWS-1)) szazalekaban kifejezve. Ujraszamolhato
+  // a genAutocells parancssal is, a teljes SETUP (sarok-ujramerés) nelkul.
+  float rowStepV = (GRID_ROWS > 1) ? 1.0f / (GRID_ROWS - 1) : 0.0f;
   for (int row = 0; row < GRID_ROWS; row++) {
     for (int col = 0; col < GRID_COLS; col++) {
       float u = (GRID_COLS > 1) ? (float)col / (GRID_COLS - 1) : 0.5f;
       float v = (GRID_ROWS > 1) ? (float)row / (GRID_ROWS - 1) : 0.5f;
+      v += (COL_Y_COMP_PERCENT[col] / 100.0f) * rowStepV;
       int idx = row * GRID_COLS + col;
       gridTargetForUV(u, v, gridCellA[idx], gridCellB[idx]);
     }
@@ -1778,6 +1789,11 @@ String executeCommandLine(String line) {
   if (cmd == "clearCells")   return cmdClearCells();
   if (cmd == "setSpeed")     return cmdSetSpeed(args);
   if (cmd == "geom")         return cmdGeom();
+  if (cmd == "genAutocells") {
+    if (!gridCornerXYValid) return "HIBA: nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).";
+    computeDefaultGridCells();
+    return "OK: automatikus cellakozeppontok ujraszamolva (oszlop-kompenzacioval).";
+  }
   return "HIBA: ismeretlen parancs: " + cmd;
 }
 
