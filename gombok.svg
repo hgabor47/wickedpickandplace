@@ -1377,5 +1377,16 @@
          style="font-size:5px;stroke-width:100"
          x="153.73532"
          y="206.08759">ALMÓD: ORIGIN</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:5px;font-family:'Arial Rounded MT Bold';-inkscape-font-specification:'Arial Rounded MT Bold, ';opacity:0.934884;fill:#000000;fill-opacity:1;stroke-width:100;stroke-linecap:square;stroke-dasharray:100, 100"
+       x="109.14998"
+       y="49.165791"
+       id="text40-9"><tspan
+         sodipodi:role="line"
+         id="tspan40-1"
+         style="font-size:5px;fill:#000000;fill-opacity:1;stroke-width:100"
+         x="109.14998"
+         y="49.165791">SHOWCELLS</tspan></text>
   </g>
 </svg>

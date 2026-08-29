@@ -343,6 +343,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   .hint { color:#888; font-size:12px; }
 </style></head><body>
 <h2>Wicked Pick and Place - cella-programozás</h2>
+<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, listCell, clearCells, setSpeed, geom, genAutocells</p>
 <p class="hint">Soronként egy parancs. Nincs szóköz a parancson kívül. Pl:<br>
 setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
@@ -758,8 +759,8 @@ bool gridCellsComputed = false;
 
 // M7: oszloponkenti Y-eltolas szazalekban (pozitiv = lejjebb/nagyobb Y, negativ = feljebb) -
 // a sor-lepeskoz (egy cellasor Y-tavolsaganak) szazalekaban ertelmezve, lasd computeDefaultGridCells().
-// col index: 0..GRID_COLS-1, balrol jobbra.
-const float COL_Y_COMP_PERCENT[GRID_COLS] = { 5.0f, 3.0f, 0.0f, -3.0f, 0.0f, 3.0f, 5.0f };
+// col index: 0..GRID_COLS-1, balrol jobbra. Futasidoben modosithato a genAutocells paranccsal.
+float COL_Y_COMP_PERCENT[GRID_COLS] = { 5.0f, 3.0f, 0.0f, -3.0f, 0.0f, 3.0f, 5.0f };
 
 // A 4 sarok VALODI (X,Y) helye (trilateracioval szamolva a sarkok mert
 // kotelhosszaibol) - ez kell ahhoz, hogy a soron kovetkezo interpolacio a
@@ -1772,6 +1773,42 @@ String cmdGeom() {
   return out;
 }
 
+// genAutocells [P0,P1,...,P6] - opcionalis GRID_COLS db vesszovel elvalasztott szazalek
+// (COL_Y_COMP_PERCENT felulirasa); parameter nelkul csak a betarolt ertekeket irja ki
+// es (ha van ervenyes kalibracio) ujraszamolja veluk a cellakat.
+String cmdGenAutocells(const String &args) {
+  bool paramsProvided = (args.length() > 0);
+  if (paramsProvided) {
+    float vals[GRID_COLS];
+    int pos = 0;
+    int count = 0;
+    for (count = 0; count < GRID_COLS; count++) {
+      String tok = (count == GRID_COLS - 1) ? args.substring(pos) : splitToken(args, pos, ',');
+      if (tok.length() == 0) break;
+      vals[count] = tok.toFloat();
+    }
+    if (count != GRID_COLS) {
+      return "HIBA: genAutocells " + String(GRID_COLS) + " vesszovel elvalasztott szazalekot var (pl. 5,3,0,-3,0,3,5).";
+    }
+    for (int i = 0; i < GRID_COLS; i++) COL_Y_COMP_PERCENT[i] = vals[i];
+  }
+
+  String percentList;
+  for (int i = 0; i < GRID_COLS; i++) {
+    percentList += formatNum(COL_Y_COMP_PERCENT[i]);
+    if (i < GRID_COLS - 1) percentList += ",";
+  }
+
+  if (!gridCornerXYValid) {
+    return "COL_Y_COMP_PERCENT=" + percentList + " (nincs ervenyes racs-kalibracio, cellak nem lettek ujraszamolva)";
+  }
+  if (!paramsProvided) {
+    return "COL_Y_COMP_PERCENT (betarolt ertekek)=" + percentList;
+  }
+  computeDefaultGridCells();
+  return "OK: uj COL_Y_COMP_PERCENT beallitva, cellak ujraszamolva=" + percentList;
+}
+
 String executeCommandLine(String line) {
   line.trim();
   if (line.length() == 0) return "";
@@ -1789,11 +1826,7 @@ String executeCommandLine(String line) {
   if (cmd == "clearCells")   return cmdClearCells();
   if (cmd == "setSpeed")     return cmdSetSpeed(args);
   if (cmd == "geom")         return cmdGeom();
-  if (cmd == "genAutocells") {
-    if (!gridCornerXYValid) return "HIBA: nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).";
-    computeDefaultGridCells();
-    return "OK: automatikus cellakozeppontok ujraszamolva (oszlop-kompenzacioval).";
-  }
+  if (cmd == "genAutocells") return cmdGenAutocells(args);
   return "HIBA: ismeretlen parancs: " + cmd;
 }
 
