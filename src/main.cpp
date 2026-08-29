@@ -30,9 +30,9 @@
 #define DIR_B_PIN      14
 #define ENABLE_PIN     13   // közös ENABLE mindkét A4988-nak
 
-#define MAGNET_PWM_PIN 32   // IBT-2 RPWM
-#define MAGNET_EN_PIN  33   // IBT-2 R_EN (folyamatosan HIGH-on tartva)
-// IBT-2 L_EN / LPWM nincs bekötve az ESP32-ről (fizikailag GND-re kötve a panelen).
+#define MAGNET_PWM_PIN  32  // IBT-2 RPWM (Eszak-fel hid)
+#define MAGNET_LPWM_PIN 16  // IBT-2 LPWM (Del-fel hid)
+#define MAGNET_EN_PIN   33  // IBT-2 R_EN + L_EN kozosen bekotve (a modulon athidalva), folyamatosan HIGH-on tartva
 
 // Gomb 6 = GPIO23 (belső + külső 4.7k pull-up), a többi a sémának megfelelő.
 const int buttonPins[8] = {4, 5, 18, 19, 34, 23, 36, 39};
@@ -108,11 +108,20 @@ const float TESTMOTOR_SPEED_MM_S  = 20.0;  // testMotor diagnosztika sebessege
 const float TESTMOTOR_ACCEL_MM_S2 = 300.0;
 
 // ============ ELEKTROMÁGNES PWM PARAMÉTEREK (core 2.x LEDC API) ============
-const int PWM_CHANNEL   = 0;
+// Teljes H-hid: PWM_CHANNEL_R -> RPWM (Eszak), PWM_CHANNEL_L -> LPWM (Del).
+// A ket csatorna sose lehet egyszerre nem-nulla (atloves a hidban) - lasd magnetSetDuty().
+const int PWM_CHANNEL_R  = 0;
+const int PWM_CHANNEL_L  = 1;
 const int PWM_FREQ_HZ   = 1000;
 const int PWM_RES_BITS  = 8;
 const unsigned long MAGNET_BOOST_MS = 200;
 const uint8_t MAGNET_HOLD_DUTY = 130;
+// Iranyvaltaskor mindket csatorna 0-ra all, es ennyit varunk mielott az uj oldalt
+// bekapcsolnank - a tekercs induktiv, az aram nem tud pillanatszeruen megfordulni.
+const unsigned long MAGNET_DIR_SWITCH_DEADTIME_MS = 5;
+
+enum MagnetDirection : uint8_t { MAGNET_NORTH = 0, MAGNET_SOUTH = 1 };
+MagnetDirection magnetDirection = MAGNET_NORTH; // legutobb aktivalt/kivalasztott irany
 
 // ============ CELLA-TÁROLÁS: LITTLEFS + NVS ============
 #define MAX_STEPS            12   // queue-elemenkénti max lépésszám
@@ -266,6 +275,7 @@ struct QueueItem {
   long testSteps;               // QI_MOTOR_TEST: lépésszám oda-vissza
   uint8_t magnetDutyPercent;    // QI_MAGNET_TEST: 0-100
   uint16_t magnetDurationSec;   // QI_MAGNET_TEST: mp
+  uint8_t magnetDirection;      // QI_MAGNET_TEST: MagnetDirection (0=Eszak, 1=Del)
 };
 
 #define MOTION_QUEUE_LEN 8
@@ -352,8 +362,10 @@ listCell</p>
 <div class="quick">
   <button onclick="quick('testMotor 0,200')">motor1</button>
   <button onclick="quick('testMotor 1,200')">motor2</button>
-  <button onclick="quick('testMagnet 100,3')">magnet100</button>
-  <button onclick="quick('testMagnet 50,3')">magnet50</button>
+  <button onclick="quick('testMagnet 100,3,n')">magnet100 eszak</button>
+  <button onclick="quick('testMagnet 50,3,n')">magnet50 eszak</button>
+  <button onclick="quick('testMagnet 100,3,s')">magnet100 del</button>
+  <button onclick="quick('testMagnet 50,3,s')">magnet50 del</button>
 </div>
 <div id="out"></div>
 <script>
@@ -565,17 +577,30 @@ void moveToBlocking(float x, float y, float speedMmPerSec) {
   currentY = y;
 }
 
-// ============ ELEKTROMÁGNES: BOOST-THEN-HOLD ============
-unsigned long engageMagnet() {
-  ledcWrite(PWM_CHANNEL, 255);
+// ============ ELEKTROMÁGNES: IRÁNYVÁLTÁS + BOOST-THEN-HOLD ============
+// Biztonsagos duty-iras: ha iranyt valt, eloszor mindket felhidat 0-ra huzza es
+// holtidot tart, csak utana kapcsolja be az uj oldalt - sose fut egyszerre a ket oldal.
+void magnetSetDuty(MagnetDirection dir, uint8_t duty) {
+  if (dir != magnetDirection) {
+    ledcWrite(PWM_CHANNEL_R, 0);
+    ledcWrite(PWM_CHANNEL_L, 0);
+    delay(MAGNET_DIR_SWITCH_DEADTIME_MS);
+    magnetDirection = dir;
+  }
+  ledcWrite((dir == MAGNET_NORTH) ? PWM_CHANNEL_R : PWM_CHANNEL_L, duty);
+}
+
+unsigned long engageMagnet(MagnetDirection dir = magnetDirection) {
+  magnetSetDuty(dir, 255);
   delay(MAGNET_BOOST_MS);
-  ledcWrite(PWM_CHANNEL, MAGNET_HOLD_DUTY);
+  magnetSetDuty(dir, MAGNET_HOLD_DUTY);
   penDown = true;
   return MAGNET_BOOST_MS;
 }
 
 unsigned long releaseMagnet() {
-  ledcWrite(PWM_CHANNEL, 0);
+  ledcWrite(PWM_CHANNEL_R, 0);
+  ledcWrite(PWM_CHANNEL_L, 0);
   penDown = false;
   return 0;
 }
@@ -673,9 +698,10 @@ void executeMotorTest(const QueueItem &item) {
 
 void executeMagnetTest(const QueueItem &item) {
   uint8_t duty = (uint8_t)((int)item.magnetDutyPercent * 255 / 100);
-  ledcWrite(PWM_CHANNEL, duty);
+  magnetSetDuty((MagnetDirection)item.magnetDirection, duty);
   delay((unsigned long)item.magnetDurationSec * 1000UL);
-  ledcWrite(PWM_CHANNEL, 0);
+  ledcWrite(PWM_CHANNEL_R, 0);
+  ledcWrite(PWM_CHANNEL_L, 0);
 }
 
 // Definialva lejjebb, a racs-kalibracios (GRID_COLS/gridCellA/B) szekcio utan -
@@ -1690,17 +1716,26 @@ String cmdTestMotor(const String &args) {
 String cmdTestMagnet(const String &args) {
   int pos = 0;
   String pctStr = splitToken(args, pos, ',');
-  String secStr = args.substring(pos);
-  if (pctStr.length() == 0 || secStr.length() == 0) return "HIBA: testMagnet formatum: PCT,SEC";
+  String secStr = splitToken(args, pos, ',');
+  String dirStr = args.substring(pos);
+  if (pctStr.length() == 0 || secStr.length() == 0) return "HIBA: testMagnet formatum: PCT,SEC[,DIR]";
   int pct = pctStr.toInt();
   int sec = secStr.toInt();
   if (pct < 0 || pct > 100) return "HIBA: PCT 0..100 kozott lehet";
   if (sec <= 0 || sec > 3600) return "HIBA: SEC 1..3600 kozott lehet";
 
+  dirStr.trim();
+  dirStr.toLowerCase();
+  MagnetDirection dir = MAGNET_NORTH;
+  if (dirStr == "s" || dirStr == "south" || dirStr == "1") dir = MAGNET_SOUTH;
+  else if (dirStr.length() > 0 && dirStr != "n" && dirStr != "north" && dirStr != "0")
+    return "HIBA: DIR csak n/north/0 (eszak) vagy s/south/1 (del) lehet";
+
   QueueItem item = {};
   item.kind = QI_MAGNET_TEST;
   item.magnetDutyPercent = (uint8_t)pct;
   item.magnetDurationSec = (uint16_t)sec;
+  item.magnetDirection = (uint8_t)dir;
   if (xQueueSend(motionQueue, &item, pdMS_TO_TICKS(100)) != pdTRUE) return "HIBA: puffer tele";
   return "OK: sorba allitva (testMagnet). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
 }
@@ -1843,9 +1878,13 @@ void setup() {
   pinMode(MAGNET_EN_PIN, OUTPUT);
   digitalWrite(MAGNET_EN_PIN, HIGH);
 
-  ledcSetup(PWM_CHANNEL, PWM_FREQ_HZ, PWM_RES_BITS);
-  ledcAttachPin(MAGNET_PWM_PIN, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 0);
+  ledcSetup(PWM_CHANNEL_R, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttachPin(MAGNET_PWM_PIN, PWM_CHANNEL_R);
+  ledcWrite(PWM_CHANNEL_R, 0);
+
+  ledcSetup(PWM_CHANNEL_L, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttachPin(MAGNET_LPWM_PIN, PWM_CHANNEL_L);
+  ledcWrite(PWM_CHANNEL_L, 0);
 
   for (int i = 0; i < 4; i++) pinMode(buttonPins[i], INPUT_PULLUP);
   pinMode(buttonPins[4], INPUT);
