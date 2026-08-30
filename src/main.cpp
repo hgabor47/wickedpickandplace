@@ -31,7 +31,7 @@
 #define ENABLE_PIN     13   // közös ENABLE mindkét A4988-nak
 
 #define MAGNET_PWM_PIN  32  // IBT-2 RPWM (Eszak-fel hid)
-#define MAGNET_LPWM_PIN 16  // IBT-2 LPWM (Del-fel hid)
+#define MAGNET_LPWM_PIN 21  // IBT-2 LPWM (Del-fel hid) - GPIO16/17 WROVER-en PSRAM-nak foglalt, nem hasznalhato
 #define MAGNET_EN_PIN   33  // IBT-2 R_EN + L_EN kozosen bekotve (a modulon athidalva), folyamatosan HIGH-on tartva
 
 // Gomb 6 = GPIO23 (belső + külső 4.7k pull-up), a többi a sémának megfelelő.
@@ -41,6 +41,7 @@ bool stableState[8]      = {true, true, true, true, true, true, true, true};
 unsigned long lastDebounceTime[8] = {0};
 const unsigned long debounceDelay = 30;
 String codeBuffer = "";
+const int PLAY_CODE_LENGTH = 4; // ennyi szamjegy utan dispatchol a PLAY-mod egy kodot
 
 // gomb-index nevek olvashatosaghoz (0-alapu, buttonPins/stableState indexei)
 const int BTN1 = 0, BTN2 = 1, BTN3 = 2, BTN4 = 3, BTN5 = 4, BTN6 = 5, BTN7 = 6, BTN8 = 7;
@@ -95,7 +96,7 @@ const bool DIR_B_INVERT = false;
 // Motor: 1.8 fok/lepes (200 lepes/fordulat). A4988 microstepping: MS2 +3.3V-ra
 // kotve -> 1/4 step (MS1/MS3 GND-n). Ha az MS1/2/3 bekotes valtozik, csak ezt
 // az egy konstanst kell modositani (1=full, 2=half, 4=quarter, 8=1/8, 16=1/16).
-const float MICROSTEPPING = 4.0;
+const float MICROSTEPPING = 16.0;
 // Orso atmero (kozepertek, csavarodo zsinorral): 20mm -> kerulet = pi*20 =~ 62.83mm/fordulat.
 const float MOTOR_STEPS_PER_REV = 200.0;
 const float SPOOL_DIAMETER_MM   = 20.0;
@@ -122,6 +123,15 @@ const unsigned long MAGNET_DIR_SWITCH_DEADTIME_MS = 5;
 
 enum MagnetDirection : uint8_t { MAGNET_NORTH = 0, MAGNET_SOUTH = 1 };
 MagnetDirection magnetDirection = MAGNET_NORTH; // legutobb aktivalt/kivalasztott irany
+
+// ============ PICKANDPLACE ELJARAS PARAMETEREI ============
+// 1) boost 100% + emeles egyszerre indul, a kovetkezo fazisra csak akkor valtunk,
+//    ha MINDKETTO kesz (amelyik tovabb tart, az szabja meg a hatarido).
+const unsigned long PICKANDPLACE_BOOST_MS  = 300;                      // 100% duty ennyi ideig, felvetelnel
+const float         PICKANDPLACE_LIFT_MM   = 10.0f;                    // felfele (Y csokken) ennyivel emel felvetel kozben
+const uint8_t       PICKANDPLACE_HOLD_DUTY = (uint8_t)(50 * 255 / 100); // 50% tartoero utazas kozben
+const unsigned long PICKANDPLACE_KICK_MS   = 500;                      // ellentetes polaritasu ledobo-impulzus hossza
+const unsigned long PICKANDPLACE_CLEAR_MS  = 1000;                     // varakozas, amig az ajto biztosan eltunik
 
 // ============ CELLA-TÁROLÁS: LITTLEFS + NVS ============
 #define MAX_STEPS            12   // queue-elemenkénti max lépésszám
@@ -263,7 +273,7 @@ int findAvailableCellByCode(const String &code) {
 }
 
 // ============ MOZGÁS-QUEUE (Core0 fogyasztja) ============
-enum QueueItemKind : uint8_t { QI_SEQUENCE = 0, QI_MOTOR_TEST = 1, QI_MAGNET_TEST = 2, QI_SHOWCELLS = 3 };
+enum QueueItemKind : uint8_t { QI_SEQUENCE = 0, QI_MOTOR_TEST = 1, QI_MAGNET_TEST = 2, QI_SHOWCELLS = 3, QI_PICKANDPLACE = 4, QI_GOHOME = 5 };
 
 struct QueueItem {
   QueueItemKind kind;
@@ -276,6 +286,8 @@ struct QueueItem {
   uint8_t magnetDutyPercent;    // QI_MAGNET_TEST: 0-100
   uint16_t magnetDurationSec;   // QI_MAGNET_TEST: mp
   uint8_t magnetDirection;      // QI_MAGNET_TEST: MagnetDirection (0=Eszak, 1=Del)
+  uint8_t pickCol, pickRow;     // QI_PICKANDPLACE: felveteli cella (0-alapu, GRID_COLS/GRID_ROWS racs)
+  uint8_t dropCol, dropRow;     // QI_PICKANDPLACE: ledobo cella (0-alapu)
 };
 
 #define MOTION_QUEUE_LEN 8
@@ -353,7 +365,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   .hint { color:#888; font-size:12px; }
 </style></head><body>
 <h2>Wicked Pick and Place - cella-programozás</h2>
-<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, listCell, clearCells, setSpeed, geom, genAutocells</p>
+<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, listCell, clearCells, setSpeed, geom, genAutocells</p>
 <p class="hint">Soronként egy parancs. Nincs szóköz a parancson kívül. Pl:<br>
 setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
@@ -366,6 +378,8 @@ listCell</p>
   <button onclick="quick('testMagnet 50,3,n')">magnet50 eszak</button>
   <button onclick="quick('testMagnet 100,3,s')">magnet100 del</button>
   <button onclick="quick('testMagnet 50,3,s')">magnet50 del</button>
+  <button onclick="quick('pickAndPlace')">pickAndPlace</button>
+  <button onclick="quick('goHome')">goHome</button>
 </div>
 <div id="out"></div>
 <script>
@@ -588,6 +602,9 @@ void magnetSetDuty(MagnetDirection dir, uint8_t duty) {
     magnetDirection = dir;
   }
   ledcWrite((dir == MAGNET_NORTH) ? PWM_CHANNEL_R : PWM_CHANNEL_L, duty);
+  webLogf("MAGNET: irany=%s duty=%d/255 (csatorna=%s)",
+          (dir == MAGNET_NORTH) ? "ESZAK" : "DEL", duty,
+          (dir == MAGNET_NORTH) ? "R/GPIO32" : "L/GPIO16");
 }
 
 unsigned long engageMagnet(MagnetDirection dir = magnetDirection) {
@@ -707,6 +724,8 @@ void executeMagnetTest(const QueueItem &item) {
 // Definialva lejjebb, a racs-kalibracios (GRID_COLS/gridCellA/B) szekcio utan -
 // itt csak a motionExecTask dispatch-hez kell a prototipus.
 void executeShowCells();
+void executePickAndPlace(uint8_t pickCol, uint8_t pickRow, uint8_t dropCol, uint8_t dropRow);
+void executeGoHome();
 
 void motionExecTask(void *parameter) {
   QueueItem item;
@@ -718,6 +737,8 @@ void motionExecTask(void *parameter) {
         case QI_MOTOR_TEST:  executeMotorTest(item);     break;
         case QI_MAGNET_TEST: executeMagnetTest(item);    break;
         case QI_SHOWCELLS:   executeShowCells();          break;
+        case QI_PICKANDPLACE: executePickAndPlace(item.pickCol, item.pickRow, item.dropCol, item.dropRow); break;
+        case QI_GOHOME:       executeGoHome();             break;
       }
       webLogf("Vegrehajtva. Pufferben meg: %d elem.", (int)uxQueueMessagesWaiting(motionQueue));
     }
@@ -754,7 +775,7 @@ void dispatchCodeToQueue(const String &code) {
 void handleDigit(char digit) {
   codeBuffer += digit;
   webLogf("Kod: %s", codeBuffer.c_str());
-  if (codeBuffer.length() >= 6) {
+  if (codeBuffer.length() >= PLAY_CODE_LENGTH) {
     String code = codeBuffer;
     codeBuffer = "";
     dispatchCodeToQueue(code);
@@ -1164,6 +1185,80 @@ void executeShowCells() {
   webLog("SHOWCELLS: bejaras kesz (35/35 cella).");
 }
 
+// ============ PICKANDPLACE: felveteli+ledobo teszt-eljaras (BTN7 az EDIT_MENU-ben) ============
+// 1) felvetel: 100% boost + 10mm emeles (Y csokken, a horgonyok fele) EGYSZERRE
+//    indul - a kovetkezo fazisra csak akkor valtunk, ha MINDKETTO kesz (amelyik
+//    tovabb tart, az szabja meg a hatarido). Ezert nem kulon blokkolo delay+mozgas,
+//    hanem egy kozos varakozo ciklus (mint moveToBlocking() isRunning()-loop-ja).
+// 2) utazas 50%-os tartoerovel a ledobo cellara (a magnes duty allando, nincs
+//    szukseg tovabbi interleavelesre - a kar egyben mozog).
+// 3) celban ellentetes polaritasu "kick" ledobja az ajtot, majd varunk, amig eltunik.
+void executePickAndPlace(uint8_t pickCol, uint8_t pickRow, uint8_t dropCol, uint8_t dropRow) {
+  if (!gridCornerXYValid) {
+    webLog("PICKANDPLACE: HIBA - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).");
+    return;
+  }
+  int pickIdx = pickRow * GRID_COLS + pickCol;
+  int dropIdx = dropRow * GRID_COLS + dropCol;
+  if (pickCol >= GRID_COLS || pickRow >= GRID_ROWS || dropCol >= GRID_COLS || dropRow >= GRID_ROWS) {
+    webLog("PICKANDPLACE: HIBA - ervenytelen cella-index.");
+    return;
+  }
+
+  float pickX, pickY, dropX, dropY;
+  if (!trilaterateSteps(gridCellA[pickIdx], gridCellB[pickIdx], pickX, pickY) ||
+      !trilaterateSteps(gridCellA[dropIdx], gridCellB[dropIdx], dropX, dropY)) {
+    webLog("PICKANDPLACE: HIBA - step->XY atszamitas sikertelen.");
+    return;
+  }
+
+  webLogf("PICKANDPLACE: felvetel cella(col=%d,row=%d) -> ledobas cella(col=%d,row=%d).",
+          pickCol, pickRow, dropCol, dropRow);
+
+  moveToBlocking(pickX, pickY, SPEED_TRAVEL);
+
+  // --- 1) boost 100% + emeles 10mm egyszerre, mindkettore varunk ---
+  magnetSetDuty(MAGNET_NORTH, 255);
+  unsigned long boostStart = millis();
+  float liftY = pickY - PICKANDPLACE_LIFT_MM; // felfele = Y csokken (horgonyok fele)
+  float lenA, lenB;
+  computeStringLengths(pickX, liftY, lenA, lenB);
+  applyProportionalMove(mmToSteps(lenA), mmToSteps(lenB), SPEED_CARRY, ACCEL_MM_S2);
+  while (motorA->isRunning() || motorB->isRunning() || (millis() - boostStart) < PICKANDPLACE_BOOST_MS) {
+    delay(2);
+  }
+  currentX = pickX; currentY = liftY;
+  penDown = true;
+
+  // --- 2) 50% tartoero, utazas a ledobo cellara ---
+  magnetSetDuty(MAGNET_NORTH, PICKANDPLACE_HOLD_DUTY);
+  moveToBlocking(dropX, dropY, SPEED_CARRY);
+
+  // --- 3) ellentetes polaritasu kick, majd varakozas amig eltunik ---
+  magnetSetDuty(MAGNET_SOUTH, 255);
+  delay(PICKANDPLACE_KICK_MS);
+  releaseMagnet();
+  delay(PICKANDPLACE_CLEAR_MS);
+
+  webLog("PICKANDPLACE: kesz.");
+}
+
+// ============ GOHOME: cella(0,0)-ra all (BTN5 az EDIT_MENU-ben) ============
+void executeGoHome() {
+  if (!gridCornerXYValid) {
+    webLog("GOHOME: HIBA - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).");
+    return;
+  }
+  float x, y;
+  if (!trilaterateSteps(gridCellA[0], gridCellB[0], x, y)) {
+    webLog("GOHOME: HIBA - step->XY atszamitas sikertelen.");
+    return;
+  }
+  moveToBlocking(x, y, SPEED_TRAVEL);
+  syncStateFromMotors();
+  webLog("GOHOME: cella(0,0) elerve.");
+}
+
 // ============ ACK VISSZAJELZES: motor oda-vissza mozgatas gombnyomasra ============
 const float ACK_SPEED_MM_S  = 40.0;
 const float ACK_ACCEL_MM_S2 = 400.0;
@@ -1549,6 +1644,38 @@ void onButtonPressed(int i) {
         }
         break;
       }
+      case BTN7: {
+        if (!gridCornerXYValid) {
+          webLog("PICKANDPLACE: elutasitva - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).");
+          break;
+        }
+        QueueItem item = {};
+        item.kind = QI_PICKANDPLACE;
+        item.pickCol = 2; item.pickRow = 1;
+        item.dropCol = 3; item.dropRow = 4;
+        if (xQueueSend(motionQueue, &item, 0) != pdTRUE) {
+          webLog("PICKANDPLACE: HIBA - mozgas-puffer tele.");
+        } else {
+          webLog("PICKANDPLACE: teszt sorba allitva.");
+          ackRight(2);
+        }
+        break;
+      }
+      case BTN5: {
+        if (!gridCornerXYValid) {
+          webLog("GOHOME: elutasitva - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).");
+          break;
+        }
+        QueueItem item = {};
+        item.kind = QI_GOHOME;
+        if (xQueueSend(motionQueue, &item, 0) != pdTRUE) {
+          webLog("GOHOME: HIBA - mozgas-puffer tele.");
+        } else {
+          webLog("GOHOME: sorba allitva.");
+          ackRight(2);
+        }
+        break;
+      }
       default: break;
     }
     return;
@@ -1740,6 +1867,25 @@ String cmdTestMagnet(const String &args) {
   return "OK: sorba allitva (testMagnet). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
 }
 
+// Fix teszt-eljaras: 0-alapu (2,1) cellabol felveszi, (3,4) cellara ledobja - lasd executePickAndPlace().
+String cmdPickAndPlace(const String &args) {
+  (void)args;
+  QueueItem item = {};
+  item.kind = QI_PICKANDPLACE;
+  item.pickCol = 2; item.pickRow = 1;
+  item.dropCol = 3; item.dropRow = 4;
+  if (xQueueSend(motionQueue, &item, pdMS_TO_TICKS(100)) != pdTRUE) return "HIBA: puffer tele";
+  return "OK: sorba allitva (pickAndPlace). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
+}
+
+String cmdGoHome(const String &args) {
+  (void)args;
+  QueueItem item = {};
+  item.kind = QI_GOHOME;
+  if (xQueueSend(motionQueue, &item, pdMS_TO_TICKS(100)) != pdTRUE) return "HIBA: puffer tele";
+  return "OK: sorba allitva (goHome). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
+}
+
 String cmdListCell() {
   if (!cellsFormatOk) return "HIBA: formatumverzio-elteres, futtass clearCells-t elobb.";
   String out;
@@ -1857,6 +2003,8 @@ String executeCommandLine(String line) {
   if (cmd == "errorGesture") return cmdErrorGesture(args);
   if (cmd == "testMotor")    return cmdTestMotor(args);
   if (cmd == "testMagnet")   return cmdTestMagnet(args);
+  if (cmd == "pickAndPlace") return cmdPickAndPlace(args);
+  if (cmd == "goHome")      return cmdGoHome(args);
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
   if (cmd == "setSpeed")     return cmdSetSpeed(args);
