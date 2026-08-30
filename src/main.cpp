@@ -156,6 +156,25 @@ int cellCount = 0;              // aktív cellák száma (NVS "cellNum")
 uint64_t processedBits = 0;     // bit(idx-1) = 1, ha az a cella mar aktivalodott
 bool cellsFormatOk = false;     // false = formátumverzió-eltérés, cellák NEM elérhetőek
 
+// ============ REKESZ-KOD TABLA (gombkod -> automatikus PICKANDPLACE) ============
+// A 7x5 SETUP-racs celláit 1-alapú "rekesz" sorszámmal azonosítjuk (rekesz = sor*GRID_COLS+oszlop+1).
+// A 32. rekesz (col=3,row=4) a FIX ledobó hely - minden más rekeszből ide ürít a PICKANDPLACE.
+#define REKESZ_COUNT 35
+const int DROP_REKESZ = 32;
+char rekeszCodeTable[REKESZ_COUNT + 1][5] = {{0}}; // 1-alapú, üres string = nincs kód erre a rekeszre
+uint64_t rekeszProcessedBits = 0; // bit(rekesz-1)=1, ha az a rekesz mar kiadasra kerult
+
+struct RekeszCodeDefault { uint8_t rekesz; const char *code; };
+// Gyari alapertek - csak akkor toltodik be, ha meg soha nem volt beallitva rekesz-kod tabla (lasd setup()).
+const RekeszCodeDefault REKESZ_CODE_DEFAULTS[] = {
+  {1,"1537"},{2,"7126"},{3,"3526"},{4,"7531"},{5,"4318"},{6,"3751"},{7,"1762"},
+  {8,"3724"},{9,"4615"},{10,"8431"},{11,"3678"},{12,"2671"},{13,"6415"},{14,"3876"},
+  {15,"8736"},{16,"8376"},{17,"1375"},{18,"6738"},{19,"4516"},{20,"6514"},{21,"7548"},
+  {22,"5182"},{23,"1843"},{24,"2185"},{25,"2536"},{26,"3472"},{27,"5821"},{28,"3571"},
+  {29,"6145"},{30,"6721"},{31,"6541"},{33,"1348"},{34,"1267"},{35,"3481"}
+};
+const int REKESZ_CODE_DEFAULT_COUNT = sizeof(REKESZ_CODE_DEFAULTS) / sizeof(REKESZ_CODE_DEFAULTS[0]);
+
 Preferences prefs;
 
 String cellFilePath(int idx) { return "/cell_" + String(idx); }
@@ -272,6 +291,27 @@ int findAvailableCellByCode(const String &code) {
   return -1;
 }
 
+void saveRekeszCodes() {
+  prefs.putBytes("rekeszCodes", rekeszCodeTable, sizeof(rekeszCodeTable));
+}
+void loadRekeszCodes() {
+  size_t len = prefs.getBytes("rekeszCodes", rekeszCodeTable, sizeof(rekeszCodeTable));
+  if (len != sizeof(rekeszCodeTable)) memset(rekeszCodeTable, 0, sizeof(rekeszCodeTable));
+}
+void saveRekeszProcessedBits() {
+  prefs.putULong64("rekeszProcBits", rekeszProcessedBits);
+}
+
+int findAvailableRekeszByCode(const String &code) {
+  for (int r = 1; r <= REKESZ_COUNT; r++) {
+    bool processed = (rekeszProcessedBits >> (r - 1)) & 1ULL;
+    if (rekeszCodeTable[r][0] != '\0' && code.equals(rekeszCodeTable[r]) && !processed) {
+      return r;
+    }
+  }
+  return -1;
+}
+
 // ============ MOZGÁS-QUEUE (Core0 fogyasztja) ============
 enum QueueItemKind : uint8_t { QI_SEQUENCE = 0, QI_MOTOR_TEST = 1, QI_MAGNET_TEST = 2, QI_SHOWCELLS = 3, QI_PICKANDPLACE = 4, QI_GOHOME = 5 };
 
@@ -365,7 +405,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   .hint { color:#888; font-size:12px; }
 </style></head><body>
 <h2>Wicked Pick and Place - cella-programozás</h2>
-<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, listCell, clearCells, setSpeed, geom, genAutocells</p>
+<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, listCell, clearCells, setSpeed, geom, genAutocells</p>
 <p class="hint">Soronként egy parancs. Nincs szóköz a parancson kívül. Pl:<br>
 setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
@@ -726,6 +766,9 @@ void executeMagnetTest(const QueueItem &item) {
 void executeShowCells();
 void executePickAndPlace(uint8_t pickCol, uint8_t pickRow, uint8_t dropCol, uint8_t dropRow);
 void executeGoHome();
+// Ugyanigy a rekesz->racs (col,row) atszamitas is a GRID_COLS/GRID_ROWS utan van definialva,
+// de a gombkod-feloldashoz (dispatchCodeToQueue) mar itt kell a prototipus.
+bool rekeszToColRow(int rekesz, uint8_t &col, uint8_t &row);
 
 void motionExecTask(void *parameter) {
   QueueItem item;
@@ -747,6 +790,30 @@ void motionExecTask(void *parameter) {
 
 // ============ GOMBKÓD -> QUEUE ============
 void dispatchCodeToQueue(const String &code) {
+  // 1) rekesz-kod tabla (cellCode paranccsal beallitott, automatikus PICKANDPLACE-t inditó kodok) -
+  // ez az elsodleges ut, a regi setCell/cellCache-alapu szekvenciak csak masodlagosan probalkoznak.
+  int rekesz = findAvailableRekeszByCode(code);
+  if (rekesz >= 0) {
+    uint8_t pickCol, pickRow, dropCol, dropRow;
+    if (!rekeszToColRow(rekesz, pickCol, pickRow) || !rekeszToColRow(DROP_REKESZ, dropCol, dropRow)) {
+      webLogf("REKESZKOD: HIBA - rekesz->racs atszamitas sikertelen (rekesz=%d).", rekesz);
+      return;
+    }
+    QueueItem item = {};
+    item.kind = QI_PICKANDPLACE;
+    item.pickCol = pickCol; item.pickRow = pickRow;
+    item.dropCol = dropCol; item.dropRow = dropRow;
+    if (xQueueSend(motionQueue, &item, 0) != pdTRUE) {
+      webLog("HIBA: mozgas-puffer tele, a kod elveszett.");
+      return;
+    }
+    rekeszProcessedBits |= (1ULL << (rekesz - 1));
+    saveRekeszProcessedBits();
+    webLogf("Rekesz #%d (kod %s) sorba allitva PICKANDPLACE-kent. Pufferben: %d elem.",
+            rekesz, code.c_str(), (int)uxQueueMessagesWaiting(motionQueue));
+    return;
+  }
+
   if (!cellsFormatOk) {
     webLog("Cellak nem elerhetoek (formatumverzio-elteres) - futtass clearCells-t elobb.");
     return;
@@ -794,6 +861,15 @@ void handleDigit(char digit) {
 #define GRID_COLS        7
 #define GRID_ROWS        5
 #define GRID_CELL_COUNT  (GRID_COLS * GRID_ROWS)
+
+// 1-alapu rekeszszam -> 0-alapu (col,row) a 7x5 racson (sor-major: rekesz = row*GRID_COLS+col+1).
+bool rekeszToColRow(int rekesz, uint8_t &col, uint8_t &row) {
+  if (rekesz < 1 || rekesz > REKESZ_COUNT) return false;
+  int idx = rekesz - 1;
+  col = idx % GRID_COLS;
+  row = idx / GRID_COLS;
+  return true;
+}
 
 // sarokindex: 0=(0,0) 1=(0,YMAX) 2=(XMAX,0) 3=(XMAX,YMAX)
 long gridCornerA[4] = {0};
@@ -1886,6 +1962,55 @@ String cmdGoHome(const String &args) {
   return "OK: sorba allitva (goHome). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
 }
 
+// cellCode {REKESZ,KOD},{REKESZ,KOD},... - rekesz-kod parok beallitasa/felulirasa (a 32-es
+// rekesz a fix ledobo hely, nem kene felvetelre kodolni, de nincs kulon tiltva). Parameter
+// nelkul a jelenlegi teljes tablat listazza ki.
+String cmdCellCode(const String &args) {
+  if (args.length() == 0) {
+    String out;
+    for (int r = 1; r <= REKESZ_COUNT; r++) {
+      out += String(r) + ",";
+      out += (rekeszCodeTable[r][0] != '\0') ? String(rekeszCodeTable[r]) : "-";
+      if (rekeszCodeTable[r][0] != '\0') {
+        bool proc = (rekeszProcessedBits >> (r - 1)) & 1ULL;
+        out += proc ? " [processed]" : " [ready]";
+      }
+      if (r == DROP_REKESZ) out += " (LEDOBO)";
+      out += "\n";
+    }
+    return out;
+  }
+
+  int pos = 0, n = args.length(), count = 0;
+  while (pos < n) {
+    if (args[pos] != '{') return "HIBA: cellCode formatum: {REKESZ,KOD},{REKESZ,KOD},...";
+    pos++;
+    int c = args.indexOf(',', pos);
+    if (c < 0) return "HIBA: cellCode formatum: {REKESZ,KOD},{REKESZ,KOD},...";
+    int rekesz = args.substring(pos, c).toInt();
+    pos = c + 1;
+    int e = args.indexOf('}', pos);
+    if (e < 0) return "HIBA: cellCode formatum: {REKESZ,KOD},{REKESZ,KOD},...";
+    String code = args.substring(pos, e);
+    pos = e + 1;
+    if (pos < n) {
+      if (args[pos] != ',') return "HIBA: cellCode formatum: {REKESZ,KOD},{REKESZ,KOD},...";
+      pos++;
+    }
+
+    if (rekesz < 1 || rekesz > REKESZ_COUNT) return "HIBA: ervenytelen rekeszszam: " + String(rekesz);
+    if (code.length() == 0 || code.length() > 4) return "HIBA: a kod max 4 karakter lehet (rekesz " + String(rekesz) + ")";
+
+    code.toCharArray(rekeszCodeTable[rekesz], sizeof(rekeszCodeTable[rekesz]));
+    rekeszProcessedBits &= ~(1ULL << (rekesz - 1)); // uj/felulirt kod - ujra kiadhato
+    count++;
+  }
+
+  saveRekeszCodes();
+  saveRekeszProcessedBits();
+  return "OK: " + String(count) + " rekesz-kod par mentve.";
+}
+
 String cmdListCell() {
   if (!cellsFormatOk) return "HIBA: formatumverzio-elteres, futtass clearCells-t elobb.";
   String out;
@@ -2005,6 +2130,7 @@ String executeCommandLine(String line) {
   if (cmd == "testMagnet")   return cmdTestMagnet(args);
   if (cmd == "pickAndPlace") return cmdPickAndPlace(args);
   if (cmd == "goHome")      return cmdGoHome(args);
+  if (cmd == "cellCode")    return cmdCellCode(args);
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
   if (cmd == "setSpeed")     return cmdSetSpeed(args);
@@ -2062,6 +2188,19 @@ void setup() {
   } else {
     cellsFormatOk = true;
     loadAllCells();
+  }
+
+  loadRekeszCodes();
+  rekeszProcessedBits = prefs.getULong64("rekeszProcBits", 0);
+  if (!prefs.getBool("rekeszInit", false)) {
+    for (int i = 0; i < REKESZ_CODE_DEFAULT_COUNT; i++) {
+      const RekeszCodeDefault &d = REKESZ_CODE_DEFAULTS[i];
+      strncpy(rekeszCodeTable[d.rekesz], d.code, 4);
+      rekeszCodeTable[d.rekesz][4] = '\0';
+    }
+    saveRekeszCodes();
+    prefs.putBool("rekeszInit", true);
+    webLog("REKESZKOD: alapertelmezett rekesz-kod tabla betoltve (elso inditas).");
   }
 
   loadGridCorners();
