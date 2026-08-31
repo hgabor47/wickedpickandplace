@@ -163,6 +163,9 @@ bool cellsFormatOk = false;     // false = formátumverzió-eltérés, cellák N
 const int DROP_REKESZ = 32;
 char rekeszCodeTable[REKESZ_COUNT + 1][5] = {{0}}; // 1-alapú, üres string = nincs kód erre a rekeszre
 uint64_t rekeszProcessedBits = 0; // bit(rekesz-1)=1, ha az a rekesz mar kiadasra kerult
+// false (alapertelmezett) = egy mar kiadott rekesz kodja ujra elfogadhato; true = csak egyszer
+// adhato ki (lasd findAvailableRekeszByCode()). Futasidoben allithato: cellRepeat 0|1.
+bool rekeszBlockRepeat = false;
 
 struct RekeszCodeDefault { uint8_t rekesz; const char *code; };
 // Gyari alapertek - csak akkor toltodik be, ha meg soha nem volt beallitva rekesz-kod tabla (lasd setup()).
@@ -304,7 +307,7 @@ void saveRekeszProcessedBits() {
 
 int findAvailableRekeszByCode(const String &code) {
   for (int r = 1; r <= REKESZ_COUNT; r++) {
-    bool processed = (rekeszProcessedBits >> (r - 1)) & 1ULL;
+    bool processed = rekeszBlockRepeat && ((rekeszProcessedBits >> (r - 1)) & 1ULL);
     if (rekeszCodeTable[r][0] != '\0' && code.equals(rekeszCodeTable[r]) && !processed) {
       return r;
     }
@@ -405,7 +408,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   .hint { color:#888; font-size:12px; }
 </style></head><body>
 <h2>Wicked Pick and Place - cella-programozás</h2>
-<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, listCell, clearCells, setSpeed, geom, genAutocells</p>
+<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, cellReset, cellRepeat, listCell, clearCells, setSpeed, geom, genAutocells</p>
 <p class="hint">Soronként egy parancs. Nincs szóköz a parancson kívül. Pl:<br>
 setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
@@ -2011,6 +2014,30 @@ String cmdCellCode(const String &args) {
   return "OK: " + String(count) + " rekesz-kod par mentve.";
 }
 
+// cellReset - CSAK a rekesz-kod rendszer "mar kiadva" jelzeseit nullazza (a regi
+// setCell/cellCache processedBits-jet nem erinti, arra a clearCells valo).
+String cmdCellReset(const String &args) {
+  (void)args;
+  rekeszProcessedBits = 0;
+  saveRekeszProcessedBits();
+  return "OK: rekesz-kod kiadottsag nullazva.";
+}
+
+// cellRepeat 0|1 - parameterezi, hogy egy mar egyszer kiadott rekesz kodja ujra
+// elfogadhato-e. 0 (alapertelmezett) = ujra elfogadhato, 1 = csak egyszer adhato ki.
+// Parameter nelkul a jelenlegi beallitast irja ki.
+String cmdCellRepeat(const String &args) {
+  if (args.length() == 0) {
+    return "cellRepeat=" + String(rekeszBlockRepeat ? 1 : 0) + " (" +
+           (rekeszBlockRepeat ? "tiltva az ujboli kiadas" : "ujra kiadhato") + ")";
+  }
+  int v = args.toInt();
+  if (v != 0 && v != 1) return "HIBA: cellRepeat 0 (ujra kiadhato) vagy 1 (csak egyszer) lehet";
+  rekeszBlockRepeat = (v == 1);
+  prefs.putBool("rekeszBlockRep", rekeszBlockRepeat);
+  return "OK: cellRepeat=" + String(rekeszBlockRepeat ? 1 : 0);
+}
+
 String cmdListCell() {
   if (!cellsFormatOk) return "HIBA: formatumverzio-elteres, futtass clearCells-t elobb.";
   String out;
@@ -2131,6 +2158,8 @@ String executeCommandLine(String line) {
   if (cmd == "pickAndPlace") return cmdPickAndPlace(args);
   if (cmd == "goHome")      return cmdGoHome(args);
   if (cmd == "cellCode")    return cmdCellCode(args);
+  if (cmd == "cellReset")   return cmdCellReset(args);
+  if (cmd == "cellRepeat")  return cmdCellRepeat(args);
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
   if (cmd == "setSpeed")     return cmdSetSpeed(args);
@@ -2192,6 +2221,7 @@ void setup() {
 
   loadRekeszCodes();
   rekeszProcessedBits = prefs.getULong64("rekeszProcBits", 0);
+  rekeszBlockRepeat = prefs.getBool("rekeszBlockRep", false);
   if (!prefs.getBool("rekeszInit", false)) {
     for (int i = 0; i < REKESZ_CODE_DEFAULT_COUNT; i++) {
       const RekeszCodeDefault &d = REKESZ_CODE_DEFAULTS[i];
