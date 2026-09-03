@@ -103,7 +103,7 @@ const float SPOOL_DIAMETER_MM   = 20.0;
 const float STEPS_PER_MM = (MOTOR_STEPS_PER_REV * MICROSTEPPING) / (PI * SPOOL_DIAMETER_MM); // =~ 12.73
 
 const float SPEED_TRAVEL = 50.0;   // mm/s - ures kocsi (nem penDown)
-const float SPEED_CARRY  = 25.0;   // mm/s - targy szallitasa (penDown)
+const float SPEED_CARRY  = 22.0;   // mm/s - targy szallitasa (penDown)
 const float ACCEL_MM_S2  = 400.0;  // mm/s^2 - fo mozgas gyorsulasa/lassulasa
 const float TESTMOTOR_SPEED_MM_S  = 20.0;  // testMotor diagnosztika sebessege
 const float TESTMOTOR_ACCEL_MM_S2 = 300.0;
@@ -125,13 +125,17 @@ enum MagnetDirection : uint8_t { MAGNET_NORTH = 0, MAGNET_SOUTH = 1 };
 MagnetDirection magnetDirection = MAGNET_NORTH; // legutobb aktivalt/kivalasztott irany
 
 // ============ PICKANDPLACE ELJARAS PARAMETEREI ============
-// 1) boost 100% + emeles egyszerre indul, a kovetkezo fazisra csak akkor valtunk,
-//    ha MINDKETTO kesz (amelyik tovabb tart, az szabja meg a hatarido).
-const unsigned long PICKANDPLACE_BOOST_MS  = 300;                      // 100% duty ennyi ideig, felvetelnel
-const float         PICKANDPLACE_LIFT_MM   = 10.0f;                    // felfele (Y csokken) ennyivel emel felvetel kozben
-const uint8_t       PICKANDPLACE_HOLD_DUTY = (uint8_t)(50 * 255 / 100); // 50% tartoero utazas kozben
-const unsigned long PICKANDPLACE_KICK_MS   = 500;                      // ellentetes polaritasu ledobo-impulzus hossza
-const unsigned long PICKANDPLACE_CLEAR_MS  = 1000;                     // varakozas, amig az ajto biztosan eltunik
+// A kartya alul 1mm-es vajatban all, ezert FELFELE kell kihuzni. A tapadas
+// akkor biztos, ha a magnes mar teljesen felmagnesezodott, MIELOTT a kar
+// megmozdul - ezert a boost alatt all a mozgas (lasd executePickAndPlace()).
+// Futasidoben allithatoak a setPick paranccsal (lasd cmdSetPick).
+float         PICKANDPLACE_DIP_MM    = 5.0f;                     // cellakozep alatt ennyivel tapad ra (Y no = lefele)
+unsigned long PICKANDPLACE_SETTLE_MS = 150;                      // leereszkedes utani megnyugvas, meg a magnes elott
+unsigned long PICKANDPLACE_BOOST_MS  = 500;                      // 100% duty, MOZGAS NELKUL - ez tapasztja ra a kartyat
+float         PICKANDPLACE_LIFT_MM   = 10.0f;                    // cellakozep FOLE ennyivel emel (a dip-bol indulva)
+uint8_t       PICKANDPLACE_HOLD_DUTY = (uint8_t)(70 * 255 / 100); // 70% tartoero utazas kozben
+unsigned long PICKANDPLACE_KICK_MS   = 500;                      // ellentetes polaritasu ledobo-impulzus hossza
+unsigned long PICKANDPLACE_CLEAR_MS  = 1000;                     // varakozas, amig az ajto biztosan eltunik
 
 // ============ CELLA-TÁROLÁS: LITTLEFS + NVS ============
 #define MAX_STEPS            12   // queue-elemenkénti max lépésszám
@@ -352,6 +356,24 @@ const char* MDNS_HOSTNAME = "wickedpickandplace";
 AsyncWebServer server(80);
 AsyncEventSource events("/events");
 
+// ============ HANGJELZESEK (kliens-oldali lejatszas /log oldalon) ============
+// A 4 mp3 nyers binarisan van a firmware-be egetve (lasd platformio.ini
+// board_build.embed_files) - a szimbolumnevek az objcopy konvenciot kovetik.
+extern const uint8_t click_mp3_start[] asm("_binary_data_click_mp3_start");
+extern const uint8_t click_mp3_end[]   asm("_binary_data_click_mp3_end");
+extern const uint8_t err_mp3_start[]   asm("_binary_data_err_mp3_start");
+extern const uint8_t err_mp3_end[]     asm("_binary_data_err_mp3_end");
+extern const uint8_t start_mp3_start[] asm("_binary_data_start_mp3_start");
+extern const uint8_t start_mp3_end[]   asm("_binary_data_start_mp3_end");
+extern const uint8_t drop_mp3_start[]  asm("_binary_data_drop_mp3_start");
+extern const uint8_t drop_mp3_end[]    asm("_binary_data_drop_mp3_end");
+
+// Kulon SSE esemenynev ('sound'), NEM a 'log'-ba - igy nem kerul bele a
+// logHistory-ba es nem jatszodik le ujra minden reconnectnel (lasd events.onConnect()).
+void soundEvent(const char *name) {
+  events.send(name, "sound", millis());
+}
+
 // ============ ÉLŐ WEB-LOG (SSE) ============
 String logHistory = "";
 const size_t LOG_HISTORY_MAX = 4000;
@@ -383,7 +405,12 @@ const char LOG_PAGE_HTML[] PROGMEM = R"HTML(
   h2 { color:#eee; font-family:sans-serif; }
 </style></head><body>
 <h2>Wicked Pick and Place - élő log</h2>
+<button id="unlockBtn" onclick="unlockAudio()">Hang engedélyezése</button>
 <div id="log"></div>
+<audio id="aClick" src="/sound/click.mp3" preload="auto"></audio>
+<audio id="aErr"   src="/sound/err.mp3"   preload="auto"></audio>
+<audio id="aStart" src="/sound/start.mp3" preload="auto"></audio>
+<audio id="aDrop"  src="/sound/drop.mp3"  preload="auto"></audio>
 <script>
   const logDiv = document.getElementById('log');
   const src = new EventSource('/events');
@@ -391,6 +418,18 @@ const char LOG_PAGE_HTML[] PROGMEM = R"HTML(
     logDiv.textContent += e.data + "\n";
     window.scrollTo(0, document.body.scrollHeight);
   });
+  const soundMap = { click: 'aClick', err: 'aErr', start: 'aStart', drop: 'aDrop' };
+  src.addEventListener('sound', function(e) {
+    const a = document.getElementById(soundMap[e.data]);
+    if (a) { a.currentTime = 0; a.play().catch(()=>{}); }
+  });
+  // Mobil autoplay-korlatozas miatt kell egy user-gesture, ami "feloldja" a lejatszast.
+  function unlockAudio() {
+    ['aClick','aErr','aStart','aDrop'].forEach(id => {
+      const a = document.getElementById(id);
+      a.play().then(() => { a.pause(); a.currentTime = 0; }).catch(()=>{});
+    });
+  }
 </script>
 </body></html>
 )HTML";
@@ -408,7 +447,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   .hint { color:#888; font-size:12px; }
 </style></head><body>
 <h2>Wicked Pick and Place - cella-programozás</h2>
-<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, cellReset, cellRepeat, listCell, clearCells, setSpeed, geom, genAutocells, restartAP</p>
+<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, cellReset, cellRepeat, listCell, clearCells, setSpeed, setPick, geom, genAutocells, restartAP</p>
 <p class="hint">Soronként egy parancs. Nincs szóköz a parancson kívül. Pl:<br>
 setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
@@ -681,6 +720,7 @@ void executeResolvedStep(float targetX, float targetY, uint8_t t, uint8_t m) {
 
 // ============ QUEUE VÉGREHAJTÓ FÜGGVÉNYEK (Core0) ============
 void executeQueueSequence(const QueueItem &item) {
+  soundEvent("start");
   float baseX = currentX, baseY = currentY; // relatív szekvenciák (errorGesture) erre vonatkoznak
   for (int i = 0; i < item.stepCount; i++) {
     const MoveStep &s = item.steps[i];
@@ -800,6 +840,7 @@ void dispatchCodeToQueue(const String &code) {
     uint8_t pickCol, pickRow, dropCol, dropRow;
     if (!rekeszToColRow(rekesz, pickCol, pickRow) || !rekeszToColRow(DROP_REKESZ, dropCol, dropRow)) {
       webLogf("REKESZKOD: HIBA - rekesz->racs atszamitas sikertelen (rekesz=%d).", rekesz);
+      soundEvent("err");
       return;
     }
     QueueItem item = {};
@@ -819,11 +860,13 @@ void dispatchCodeToQueue(const String &code) {
 
   if (!cellsFormatOk) {
     webLog("Cellak nem elerhetoek (formatumverzio-elteres) - futtass clearCells-t elobb.");
+    soundEvent("err");
     return;
   }
   int idx = findAvailableCellByCode(code);
   if (idx < 0) {
     webLogf("Nincs elerheto (meg nem aktivalt) cella a kodhoz: %s", code.c_str());
+    soundEvent("err");
     return;
   }
   QueueItem item = {};
@@ -1265,14 +1308,14 @@ void executeShowCells() {
 }
 
 // ============ PICKANDPLACE: felveteli+ledobo teszt-eljaras (BTN7 az EDIT_MENU-ben) ============
-// 1) felvetel: 100% boost + 10mm emeles (Y csokken, a horgonyok fele) EGYSZERRE
-//    indul - a kovetkezo fazisra csak akkor valtunk, ha MINDKETTO kesz (amelyik
-//    tovabb tart, az szabja meg a hatarido). Ezert nem kulon blokkolo delay+mozgas,
-//    hanem egy kozos varakozo ciklus (mint moveToBlocking() isRunning()-loop-ja).
-// 2) utazas 50%-os tartoerovel a ledobo cellara (a magnes duty allando, nincs
-//    szukseg tovabbi interleavelesre - a kar egyben mozog).
-// 3) celban ellentetes polaritasu "kick" ledobja az ajtot, majd varunk, amig eltunik.
+// 1) cellakozep -> DIP_MM-rel lejjebb ereszkedes: a kartya alsó felen levo vaslemez
+//    igy a magnes kozepe ala kerul, es az emeles a kartyat FELFELE huzza ki az
+//    1mm-es vajatbol (korabban a kozeprol indulva a kartya csak lecsuszott rola).
+// 2) 100% boost MOZGAS NELKUL - a tapadas csak a teljes felmagnesezodes utan biztos.
+// 3) emeles a cellakozep FOLE, majd 70% tartoerovel utazas a ledobo cellara.
+// 4) celban ellentetes polaritasu "kick" ledobja az ajtot, majd varunk, amig eltunik.
 void executePickAndPlace(uint8_t pickCol, uint8_t pickRow, uint8_t dropCol, uint8_t dropRow) {
+  soundEvent("start");
   if (!gridCornerXYValid) {
     webLog("PICKANDPLACE: HIBA - nincs ervenyes racs-kalibracio (fejezd be eloszor a SETUP-ot).");
     return;
@@ -1296,24 +1339,24 @@ void executePickAndPlace(uint8_t pickCol, uint8_t pickRow, uint8_t dropCol, uint
 
   moveToBlocking(pickX, pickY, SPEED_TRAVEL);
 
-  // --- 1) boost 100% + emeles 10mm egyszerre, mindkettore varunk ---
+  // --- 1) leereszkedes a cellakozep ala, majd megnyugvas ---
+  moveToBlocking(pickX, pickY + PICKANDPLACE_DIP_MM, SPEED_CARRY);
+  delay(PICKANDPLACE_SETTLE_MS);
+
+  // --- 2) 100% boost ALLO karral - csak igy tapad ra biztosan a kartya ---
   magnetSetDuty(MAGNET_NORTH, 255);
-  unsigned long boostStart = millis();
-  float liftY = pickY - PICKANDPLACE_LIFT_MM; // felfele = Y csokken (horgonyok fele)
-  float lenA, lenB;
-  computeStringLengths(pickX, liftY, lenA, lenB);
-  applyProportionalMove(mmToSteps(lenA), mmToSteps(lenB), SPEED_CARRY, ACCEL_MM_S2);
-  while (motorA->isRunning() || motorB->isRunning() || (millis() - boostStart) < PICKANDPLACE_BOOST_MS) {
-    delay(2);
-  }
-  currentX = pickX; currentY = liftY;
+  delay(PICKANDPLACE_BOOST_MS);
   penDown = true;
 
-  // --- 2) 50% tartoero, utazas a ledobo cellara ---
+  // --- 3) emeles a cellakozep foles, teljes eroben (a vajatbol valo kihuzas) ---
+  moveToBlocking(pickX, pickY - PICKANDPLACE_LIFT_MM, SPEED_CARRY);
+
+  // --- 4) 70% tartoero, utazas a ledobo cellara ---
   magnetSetDuty(MAGNET_NORTH, PICKANDPLACE_HOLD_DUTY);
   moveToBlocking(dropX, dropY, SPEED_CARRY);
 
-  // --- 3) ellentetes polaritasu kick, majd varakozas amig eltunik ---
+  // --- 5) ellentetes polaritasu kick, majd varakozas amig eltunik ---
+  soundEvent("drop");
   magnetSetDuty(MAGNET_SOUTH, 255);
   delay(PICKANDPLACE_KICK_MS);
   releaseMagnet();
@@ -1815,6 +1858,7 @@ void scanButtonsAndDispatch() {
         stableState[i] = reading;
         if (reading == LOW) {
           webLogf("Gomb %d lenyomva (GPIO%d)", i + 1, buttonPins[i]);
+          soundEvent("click");
           onButtonPressed(i);
         } else {
           onButtonReleased(i);
@@ -2050,6 +2094,54 @@ String cmdCellRepeat(const String &args) {
   return "OK: cellRepeat=" + String(rekeszBlockRepeat ? 1 : 0);
 }
 
+// setPick DIP_MM,SETTLE_MS,BOOST_MS,LIFT_MM,HOLD_PCT,KICK_MS,CLEAR_MS
+// pl. setPick 5,150,300,10,70,500,1000 - parameter nelkul a jelenlegi ertekeket irja ki.
+String cmdSetPick(const String &args) {
+  if (args.length() == 0) {
+    return "setPick DIP_MM=" + String(PICKANDPLACE_DIP_MM, 1) +
+           " SETTLE_MS=" + String(PICKANDPLACE_SETTLE_MS) +
+           " BOOST_MS=" + String(PICKANDPLACE_BOOST_MS) +
+           " LIFT_MM=" + String(PICKANDPLACE_LIFT_MM, 1) +
+           " HOLD_PCT=" + String((int)((int)PICKANDPLACE_HOLD_DUTY * 100 / 255)) +
+           " KICK_MS=" + String(PICKANDPLACE_KICK_MS) +
+           " CLEAR_MS=" + String(PICKANDPLACE_CLEAR_MS);
+  }
+
+  int pos = 0;
+  String tok[7];
+  for (int i = 0; i < 7; i++) {
+    tok[i] = (i == 6) ? args.substring(pos) : splitToken(args, pos, ',');
+    if (tok[i].length() == 0) {
+      return "HIBA: setPick formatum: DIP_MM,SETTLE_MS,BOOST_MS,LIFT_MM,HOLD_PCT,KICK_MS,CLEAR_MS";
+    }
+  }
+
+  float dip     = tok[0].toFloat();
+  long  settle  = tok[1].toInt();
+  long  boost   = tok[2].toInt();
+  float lift    = tok[3].toFloat();
+  int   holdPct = tok[4].toInt();
+  long  kick    = tok[5].toInt();
+  long  clear   = tok[6].toInt();
+
+  if (dip < 0 || dip > 50)        return "HIBA: DIP_MM 0..50 kozott lehet";
+  if (settle < 0 || settle > 5000) return "HIBA: SETTLE_MS 0..5000 kozott lehet";
+  if (boost < 0 || boost > 5000)   return "HIBA: BOOST_MS 0..5000 kozott lehet";
+  if (lift < 0 || lift > 100)      return "HIBA: LIFT_MM 0..100 kozott lehet";
+  if (holdPct < 0 || holdPct > 100) return "HIBA: HOLD_PCT 0..100 kozott lehet";
+  if (kick < 0 || kick > 5000)     return "HIBA: KICK_MS 0..5000 kozott lehet";
+  if (clear < 0 || clear > 10000)  return "HIBA: CLEAR_MS 0..10000 kozott lehet";
+
+  PICKANDPLACE_DIP_MM    = dip;
+  PICKANDPLACE_SETTLE_MS = (unsigned long)settle;
+  PICKANDPLACE_BOOST_MS  = (unsigned long)boost;
+  PICKANDPLACE_LIFT_MM   = lift;
+  PICKANDPLACE_HOLD_DUTY = (uint8_t)(holdPct * 255 / 100);
+  PICKANDPLACE_KICK_MS   = (unsigned long)kick;
+  PICKANDPLACE_CLEAR_MS  = (unsigned long)clear;
+  return "OK: " + cmdSetPick("");
+}
+
 String cmdListCell() {
   if (!cellsFormatOk) return "HIBA: formatumverzio-elteres, futtass clearCells-t elobb.";
   String out;
@@ -2176,6 +2268,7 @@ String executeCommandLine(String line) {
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
   if (cmd == "setSpeed")     return cmdSetSpeed(args);
+  if (cmd == "setPick")      return cmdSetPick(args);
   if (cmd == "geom")         return cmdGeom();
   if (cmd == "genAutocells") return cmdGenAutocells(args);
   return "HIBA: ismeretlen parancs: " + cmd;
@@ -2318,6 +2411,20 @@ void setup() {
   });
   server.on("/program", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", PROGRAM_PAGE_HTML);
+  });
+
+  // ---- Hangfajlok (firmware-be egetve, lasd platformio.ini embed_files) ----
+  server.on("/sound/click.mp3", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "audio/mpeg", click_mp3_start, click_mp3_end - click_mp3_start);
+  });
+  server.on("/sound/err.mp3", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "audio/mpeg", err_mp3_start, err_mp3_end - err_mp3_start);
+  });
+  server.on("/sound/start.mp3", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "audio/mpeg", start_mp3_start, start_mp3_end - start_mp3_start);
+  });
+  server.on("/sound/drop.mp3", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "audio/mpeg", drop_mp3_start, drop_mp3_end - drop_mp3_start);
   });
 
   // POST /cmd - textarea tartalma soronkent vegrehajtva. Egyszerre egy

@@ -31,7 +31,8 @@
      inkscape:window-x="3832"
      inkscape:window-y="359"
      inkscape:window-maximized="1"
-     inkscape:current-layer="layer1" />
+     inkscape:current-layer="layer1"
+     showgrid="false" />
   <defs
      id="defs1" />
   <g
@@ -474,17 +475,6 @@
          style="stroke-width:100"
          x="226.64523"
          y="69.541496">ACK=Rightx2</tspan></text>
-    <text
-       xml:space="preserve"
-       style="font-size:4.99999px;font-family:'Arial Rounded MT Bold';-inkscape-font-specification:'Arial Rounded MT Bold, ';opacity:0.934884;fill:#000000;fill-opacity:1;stroke-width:100;stroke-linecap:square;stroke-dasharray:100, 100"
-       x="88.948441"
-       y="62.841484"
-       id="text49"><tspan
-         sodipodi:role="line"
-         id="tspan49"
-         style="stroke-width:100"
-         x="88.948441"
-         y="62.841484">ACK=Rightx2</tspan></text>
     <text
        xml:space="preserve"
        style="font-size:4.99999px;font-family:'Arial Rounded MT Bold';-inkscape-font-specification:'Arial Rounded MT Bold, ';opacity:0.934884;fill:#000000;fill-opacity:1;stroke-width:100;stroke-linecap:square;stroke-dasharray:100, 100"
@@ -1388,5 +1378,27 @@
          style="font-size:5px;fill:#000000;fill-opacity:1;stroke-width:100"
          x="109.14998"
          y="49.165791">SHOWCELLS</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:5px;font-family:'Arial Rounded MT Bold';-inkscape-font-specification:'Arial Rounded MT Bold, ';opacity:0.934884;fill:#000000;fill-opacity:1;stroke-width:100;stroke-linecap:square;stroke-dasharray:100, 100"
+       x="109.73862"
+       y="55.046974"
+       id="text40-9-8"><tspan
+         sodipodi:role="line"
+         id="tspan40-1-3"
+         style="font-size:5px;fill:#000000;fill-opacity:1;stroke-width:100"
+         x="109.73862"
+         y="55.046974">PICKPLACE</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:5px;font-family:'Arial Rounded MT Bold';-inkscape-font-specification:'Arial Rounded MT Bold, ';opacity:0.934884;fill:#000000;fill-opacity:1;stroke-width:100;stroke-linecap:square;stroke-dasharray:100, 100"
+       x="109.50632"
+       y="61.908363"
+       id="text40-9-8-8"><tspan
+         sodipodi:role="line"
+         id="tspan40-1-3-7"
+         style="font-size:5px;fill:#000000;fill-opacity:1;stroke-width:100"
+         x="109.50632"
+         y="61.908363">GOHOME</tspan></text>
   </g>
 </svg>
