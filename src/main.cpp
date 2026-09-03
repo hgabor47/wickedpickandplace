@@ -408,7 +408,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   .hint { color:#888; font-size:12px; }
 </style></head><body>
 <h2>Wicked Pick and Place - cella-programozás</h2>
-<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, cellReset, cellRepeat, listCell, clearCells, setSpeed, geom, genAutocells</p>
+<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, cellReset, cellRepeat, listCell, clearCells, setSpeed, geom, genAutocells, restartAP</p>
 <p class="hint">Soronként egy parancs. Nincs szóköz a parancson kívül. Pl:<br>
 setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
@@ -1965,6 +1965,18 @@ String cmdGoHome(const String &args) {
   return "OK: sorba allitva (goHome). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
 }
 
+// restartAP - a KOVETKEZO (es csak azon egyetlen) bootnal AP modot kenyszerit,
+// fuggetlenul az ismert WiFi-halozatok elerhetosegetol. A flag-et setup() a
+// legelso dolgok kozott torli, igy utana megint a normal STA->AP-fallback fut.
+String cmdRestartAP(const String &args) {
+  (void)args;
+  prefs.putBool("forceApOnce", true);
+  webLog("restartAP: kovetkezo inditasnal AP mod kenyszeritve, ujrainditas...");
+  delay(500);
+  ESP.restart();
+  return "";
+}
+
 // cellCode {REKESZ,KOD},{REKESZ,KOD},... - rekesz-kod parok beallitasa/felulirasa (a 32-es
 // rekesz a fix ledobo hely, nem kene felvetelre kodolni, de nincs kulon tiltva). Parameter
 // nelkul a jelenlegi teljes tablat listazza ki.
@@ -2157,6 +2169,7 @@ String executeCommandLine(String line) {
   if (cmd == "testMagnet")   return cmdTestMagnet(args);
   if (cmd == "pickAndPlace") return cmdPickAndPlace(args);
   if (cmd == "goHome")      return cmdGoHome(args);
+  if (cmd == "restartAP")   return cmdRestartAP(args);
   if (cmd == "cellCode")    return cmdCellCode(args);
   if (cmd == "cellReset")   return cmdCellReset(args);
   if (cmd == "cellRepeat")  return cmdCellRepeat(args);
@@ -2269,7 +2282,15 @@ void setup() {
   Serial.println("Pick-and-place polargraph keszul (queue-alapu mozgatas, IBT-2 PWM magnes).");
 
   // ---- WiFi ----
-  if (!connectToKnownWifi()) {
+  // A flag-et AZONNAL toroljuk (meg AP-inditas elott) - igy barhogyan is
+  // vegzodik ez a boot (pl. aramkimaradas), a kenyszeritett AP mod garantaltan
+  // csak EGYETLEN alkalommal ervenyesul (lasd cmdRestartAP()).
+  bool forceApOnce = prefs.getBool("forceApOnce", false);
+  if (forceApOnce) {
+    prefs.putBool("forceApOnce", false);
+    webLog("Kenyszeritett AP mod (restartAP parancs utan).");
+    startAccessPoint();
+  } else if (!connectToKnownWifi()) {
     startAccessPoint();
   }
 
