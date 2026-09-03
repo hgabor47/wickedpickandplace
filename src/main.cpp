@@ -102,9 +102,11 @@ const float MOTOR_STEPS_PER_REV = 200.0;
 const float SPOOL_DIAMETER_MM   = 20.0;
 const float STEPS_PER_MM = (MOTOR_STEPS_PER_REV * MICROSTEPPING) / (PI * SPOOL_DIAMETER_MM); // =~ 12.73
 
-const float SPEED_TRAVEL = 50.0;   // mm/s - ures kocsi (nem penDown)
-const float SPEED_CARRY  = 22.0;   // mm/s - targy szallitasa (penDown)
-const float ACCEL_MM_S2  = 400.0;  // mm/s^2 - fo mozgas gyorsulasa/lassulasa
+// Futasidoben allithatoak a setMoveSpeed paranccsal (lasd cmdSetMoveSpeed) - a
+// PLAY/SHOWCELLS/GOHOME/PICKANDPLACE mozgasok mind ezt hasznaljak (egyetlen igazsagforras).
+float SPEED_TRAVEL = 50.0;   // mm/s - ures kocsi (nem penDown)
+float SPEED_CARRY  = 22.0;   // mm/s - targy szallitasa (penDown)
+float ACCEL_MM_S2  = 400.0;  // mm/s^2 - fo mozgas gyorsulasa/lassulasa
 const float TESTMOTOR_SPEED_MM_S  = 20.0;  // testMotor diagnosztika sebessege
 const float TESTMOTOR_ACCEL_MM_S2 = 300.0;
 
@@ -447,7 +449,7 @@ const char PROGRAM_PAGE_HTML[] PROGMEM = R"HTML(
   .hint { color:#888; font-size:12px; }
 </style></head><body>
 <h2>Wicked Pick and Place - cella-programozás</h2>
-<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, cellReset, cellRepeat, listCell, clearCells, setSpeed, setPick, geom, genAutocells, restartAP</p>
+<p class="hint">Hasznalhato utasitasok: setCell, test, cellNum, errorGesture, testMotor, testMagnet, pickAndPlace, goHome, cellCode, cellReset, cellRepeat, listCell, clearCells, setSpeed, setMoveSpeed, setPick, geom, genAutocells, restartAP</p>
 <p class="hint">Soronként egy parancs. Nincs szóköz a parancson kívül. Pl:<br>
 setCell 1,100001,{70,70,1,1},{100,100,0,1},{680,70,255,0}<br>
 listCell</p>
@@ -1990,15 +1992,33 @@ String cmdTestMagnet(const String &args) {
   return "OK: sorba allitva (testMagnet). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
 }
 
-// Fix teszt-eljaras: 0-alapu (2,1) cellabol felveszi, (3,4) cellara ledobja - lasd executePickAndPlace().
+// Teszt-eljaras: 0-alapu felveteli cellabol (alapertelmezetten 2,1) felveszi, (3,4) cellara ledobja.
+// pickAndPlace COL,ROW - parameter nelkul az utoljara hasznalt felveteli cellat ismetli.
+uint8_t lastPickAndPlaceCol = 2, lastPickAndPlaceRow = 1;
 String cmdPickAndPlace(const String &args) {
-  (void)args;
+  uint8_t col = lastPickAndPlaceCol, row = lastPickAndPlaceRow;
+  if (args.length() > 0) {
+    int pos = 0;
+    String colStr = splitToken(args, pos, ',');
+    String rowStr = args.substring(pos);
+    if (colStr.length() == 0 || rowStr.length() == 0) return "HIBA: pickAndPlace formatum: COL,ROW";
+    int c = colStr.toInt();
+    int r = rowStr.toInt();
+    if (c < 0 || c >= GRID_COLS) return "HIBA: COL 0.." + String(GRID_COLS - 1) + " kozott lehet";
+    if (r < 0 || r >= GRID_ROWS) return "HIBA: ROW 0.." + String(GRID_ROWS - 1) + " kozott lehet";
+    col = (uint8_t)c;
+    row = (uint8_t)r;
+  }
+
   QueueItem item = {};
   item.kind = QI_PICKANDPLACE;
-  item.pickCol = 2; item.pickRow = 1;
+  item.pickCol = col; item.pickRow = row;
   item.dropCol = 3; item.dropRow = 4;
   if (xQueueSend(motionQueue, &item, pdMS_TO_TICKS(100)) != pdTRUE) return "HIBA: puffer tele";
-  return "OK: sorba allitva (pickAndPlace). Pufferben: " + String((int)uxQueueMessagesWaiting(motionQueue));
+  lastPickAndPlaceCol = col;
+  lastPickAndPlaceRow = row;
+  return "OK: sorba allitva (pickAndPlace " + String(col) + "," + String(row) + "). Pufferben: " +
+         String((int)uxQueueMessagesWaiting(motionQueue));
 }
 
 String cmdGoHome(const String &args) {
@@ -2092,6 +2112,35 @@ String cmdCellRepeat(const String &args) {
   rekeszBlockRepeat = (v == 1);
   prefs.putBool("rekeszBlockRep", rekeszBlockRepeat);
   return "OK: cellRepeat=" + String(rekeszBlockRepeat ? 1 : 0);
+}
+
+// setMoveSpeed TRAVEL_MM_S,CARRY_MM_S,ACCEL_MM_S2 - pl. 50,22,400
+// A PLAY/SHOWCELLS/GOHOME/PICKANDPLACE osszes mozgasat erinti (egyetlen igazsagforras).
+// Parameter nelkul a jelenlegi ertekeket irja ki.
+String cmdSetMoveSpeed(const String &args) {
+  if (args.length() == 0) {
+    return "setMoveSpeed TRAVEL_MM_S=" + String(SPEED_TRAVEL, 1) +
+           " CARRY_MM_S=" + String(SPEED_CARRY, 1) +
+           " ACCEL_MM_S2=" + String(ACCEL_MM_S2, 1);
+  }
+  int pos = 0;
+  String travelStr = splitToken(args, pos, ',');
+  String carryStr  = splitToken(args, pos, ',');
+  String accelStr  = args.substring(pos);
+  if (travelStr.length() == 0 || carryStr.length() == 0 || accelStr.length() == 0) {
+    return "HIBA: setMoveSpeed formatum: TRAVEL_MM_S,CARRY_MM_S,ACCEL_MM_S2";
+  }
+  float travel = travelStr.toFloat();
+  float carry  = carryStr.toFloat();
+  float accel  = accelStr.toFloat();
+  if (travel <= 0 || travel > 200) return "HIBA: TRAVEL_MM_S 0..200 kozott lehet";
+  if (carry <= 0 || carry > 200)   return "HIBA: CARRY_MM_S 0..200 kozott lehet";
+  if (accel <= 0 || accel > 2000)  return "HIBA: ACCEL_MM_S2 0..2000 kozott lehet";
+
+  SPEED_TRAVEL = travel;
+  SPEED_CARRY  = carry;
+  ACCEL_MM_S2  = accel;
+  return "OK: " + cmdSetMoveSpeed("");
 }
 
 // setPick DIP_MM,SETTLE_MS,BOOST_MS,LIFT_MM,HOLD_PCT,KICK_MS,CLEAR_MS
@@ -2268,6 +2317,7 @@ String executeCommandLine(String line) {
   if (cmd == "listCell")     return cmdListCell();
   if (cmd == "clearCells")   return cmdClearCells();
   if (cmd == "setSpeed")     return cmdSetSpeed(args);
+  if (cmd == "setMoveSpeed") return cmdSetMoveSpeed(args);
   if (cmd == "setPick")      return cmdSetPick(args);
   if (cmd == "geom")         return cmdGeom();
   if (cmd == "genAutocells") return cmdGenAutocells(args);
