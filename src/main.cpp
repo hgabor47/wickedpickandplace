@@ -132,12 +132,26 @@ MagnetDirection magnetDirection = MAGNET_NORTH; // legutobb aktivalt/kivalasztot
 // megmozdul - ezert a boost alatt all a mozgas (lasd executePickAndPlace()).
 // Futasidoben allithatoak a setPick paranccsal (lasd cmdSetPick).
 float         PICKANDPLACE_DIP_MM    = 5.0f;                     // cellakozep alatt ennyivel tapad ra (Y no = lefele)
-unsigned long PICKANDPLACE_SETTLE_MS = 150;                      // leereszkedes utani megnyugvas, meg a magnes elott
-unsigned long PICKANDPLACE_BOOST_MS  = 500;                      // 100% duty, MOZGAS NELKUL - ez tapasztja ra a kartyat
-float         PICKANDPLACE_LIFT_MM   = 10.0f;                    // cellakozep FOLE ennyivel emel (a dip-bol indulva)
-uint8_t       PICKANDPLACE_HOLD_DUTY = (uint8_t)(70 * 255 / 100); // 70% tartoero utazas kozben
+unsigned long PICKANDPLACE_SETTLE_MS = 200;                      // leereszkedes utani megnyugvas, meg a magnes elott
+unsigned long PICKANDPLACE_BOOST_MS  = 400;                      // 100% duty, MOZGAS NELKUL - ez tapasztja ra a kartyat
+float         PICKANDPLACE_LIFT_MM   = 25.0f;                    // cellakozep FOLE ennyivel emel (a dip-bol indulva)
+uint8_t       PICKANDPLACE_HOLD_DUTY = (uint8_t)(52 * 255 / 100); // 52% tartoero utazas kozben
 unsigned long PICKANDPLACE_KICK_MS   = 500;                      // ellentetes polaritasu ledobo-impulzus hossza
 unsigned long PICKANDPLACE_CLEAR_MS  = 1000;                     // varakozas, amig az ajto biztosan eltunik
+
+// Ezekbol a felveteli cellakbol a ledobohoz (3,4) vezeto egyenes at menne mas ajtok
+// felett, ezert egy koztes utponton (PATH_Special) keresztul kerulunk oda.
+struct SpecialPickPath { uint8_t col, row; float wpCol, wpRow; };
+const SpecialPickPath PICKANDPLACE_SPECIAL_PATHS[] = {
+  {0, 3, 2.5f, 3.5f}, {0, 4, 2.5f, 3.3f}, {1, 4, 2.5f, 3.3f}, // BAL
+  {6, 3, 3.5f, 3.5f}, {5, 4, 3.5f, 3.3f}, {6, 4, 3.5f, 3.3f}, // JOBB
+};
+bool findPickAndPlaceWaypoint(uint8_t col, uint8_t row, float &wpCol, float &wpRow) {
+  for (auto &p : PICKANDPLACE_SPECIAL_PATHS) {
+    if (p.col == col && p.row == row) { wpCol = p.wpCol; wpRow = p.wpRow; return true; }
+  }
+  return false;
+}
 
 // ============ CELLA-TÁROLÁS: LITTLEFS + NVS ============
 #define MAX_STEPS            12   // queue-elemenkénti max lépésszám
@@ -345,9 +359,9 @@ QueueHandle_t motionQueue;
 // ============ WIFI: ISMERT HÁLÓZATOK, AP-FALLBACK ============
 struct WifiCred { const char* ssid; const char* password; };
 const WifiCred KNOWN_NETWORKS[] = {
+  { "HGPLSOFT3",         "***REMOVED***" },
   { "HGPLSOFT",          "***REMOVED***" },
-  { "HGPLSOFT_EXT2.4G",  "***REMOVED***" },
-  { "HGPLSOFT2",         "***REMOVED***" }
+  { "HGPLSOFT_EXT2.4G",  "***REMOVED***" }
 };
 const int KNOWN_NETWORK_COUNT = sizeof(KNOWN_NETWORKS) / sizeof(KNOWN_NETWORKS[0]);
 
@@ -1195,6 +1209,20 @@ void gridUVToXY(float u, float v, float &outX, float &outY) {
   outY = bilerpFloat(gridCornerY[0], gridCornerY[2], gridCornerY[1], gridCornerY[3], u, v);
 }
 
+// Tort (nem-egesz) cella-koordinatabol (col,row) VALOS (X,Y)-t szamol, a
+// computeDefaultGridCells()-szel azonos oszloponkenti Y-korrekcioval - a
+// PATH_Special utpontjaihoz kell (lasd PICKANDPLACE_SPECIAL_PATHS).
+bool cellFracToXY(float col, float row, float &outX, float &outY) {
+  if (!gridCornerXYValid) return false;
+  float u = (GRID_COLS > 1) ? col / (GRID_COLS - 1) : 0.5f;
+  float v = (GRID_ROWS > 1) ? row / (GRID_ROWS - 1) : 0.5f;
+  int colIdx = constrain((int)lroundf(col), 0, GRID_COLS - 1);
+  float rowStepV = (GRID_ROWS > 1) ? 1.0f / (GRID_ROWS - 1) : 0.0f;
+  v += (COL_Y_COMP_PERCENT[colIdx] / 100.0f) * rowStepV;
+  gridUVToXY(u, v, outX, outY);
+  return true;
+}
+
 // A cel (X,Y)-t a sarkok VALOS (nem kotelhossz-terbeli) koordinatai kozott
 // interpolaljuk linearisan, majd abbol szamoljuk a lepesszamokat (xyToSteps).
 void gridTargetForUV(float u, float v, long &outA, long &outB) {
@@ -1353,8 +1381,14 @@ void executePickAndPlace(uint8_t pickCol, uint8_t pickRow, uint8_t dropCol, uint
   // --- 3) emeles a cellakozep foles, teljes eroben (a vajatbol valo kihuzas) ---
   moveToBlocking(pickX, pickY - PICKANDPLACE_LIFT_MM, SPEED_CARRY);
 
-  // --- 4) 70% tartoero, utazas a ledobo cellara ---
+  // --- 4) tartoero, utazas a ledobo cellara (szelso celláknal PATH_Special utponton at,
+  //        hogy ne szedjen fel utkozben mas ajtokat) ---
   magnetSetDuty(MAGNET_NORTH, PICKANDPLACE_HOLD_DUTY);
+  float wpCol, wpRow, wpX, wpY;
+  if (findPickAndPlaceWaypoint(pickCol, pickRow, wpCol, wpRow) && cellFracToXY(wpCol, wpRow, wpX, wpY)) {
+    webLogf("PICKANDPLACE: PATH_Special utponton at (col=%.1f,row=%.1f).", wpCol, wpRow);
+    moveToBlocking(wpX, wpY, SPEED_CARRY);
+  }
   moveToBlocking(dropX, dropY, SPEED_CARRY);
 
   // --- 5) ellentetes polaritasu kick, majd varakozas amig eltunik ---
