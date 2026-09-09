@@ -2483,18 +2483,26 @@ void setup() {
 
   // ---- Webszerver ----
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html",
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/html",
       "<h1>Wicked Pick and Place</h1>"
       "<p>Firmware fut.</p>"
       "<p><a href='/update'>Firmware feltoltes (OTA)</a></p>"
       "<p><a href='/log'>Elo log</a></p>"
       "<p><a href='/program'>Cella-programozas</a></p>");
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", LOG_PAGE_HTML);
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/html", LOG_PAGE_HTML);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
   server.on("/program", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", PROGRAM_PAGE_HTML);
+    // Cache nelkul: kulonben mobil "offline" allapot-erzekeleskor a bongeszo
+    // cache-elt (regi) valaszt mutatna a friss oldal helyett.
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/html", PROGRAM_PAGE_HTML);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
 
   // ---- Hangfajlok (firmware-be egetve, lasd platformio.ini embed_files) ----
