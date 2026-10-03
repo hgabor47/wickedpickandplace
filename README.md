@@ -1,4 +1,4 @@
-# Wicked Pick and Place
+# Wicked Pick and Place - Polargraph
 
 > ESP32-alapú polargraph elven működő **automata ajándékosztó gép**: két léptetőmotor
 > tartja és mozgatja egy dyneema damil-párral a kulisszát, mely egy saját tekercselésű
@@ -26,7 +26,19 @@ kulissza pozícióját a damilhosszak változtatásával lehet vezérelni), ami
   nyitja ki; emellett egy beépített webes felület kezeli a konfigurációt és a
   teszt-parancsokat
 
-**Videók**: [működés közben](https://youtu.be/3DLXGTaiHjw) · [technikai bemutató](https://youtu.be/2DnzCukh6VA)
+## Videók
+
+<div align="center">
+  <a href="https://youtu.be/3DLXGTaiHjw">
+    <img src="https://img.youtube.com/vi/3DLXGTaiHjw/maxresdefault.jpg" alt="Működés közben" width="400">
+    <br>▶ Működés közben
+  </a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://youtu.be/2DnzCukh6VA">
+    <img src="https://img.youtube.com/vi/2DnzCukh6VA/maxresdefault.jpg" alt="Technikai bemutató" width="400">
+    <br>▶ Technikai bemutató
+  </a>
+</div>
 
 ## Fő funkciók
 
