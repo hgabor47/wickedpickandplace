@@ -80,6 +80,13 @@ kulissza pozícióját a damilhosszak változtatásával lehet vezérelni), ami
 
 Teljes, interaktív verzió: [circuit_schema_v19.html](circuit_schema_v19.html).
 
+## Mechanikai terv (3D / lézervágás)
+
+A kulissza és a gép összes lézerrel vágott lapjának reprodukálható terve egy
+Blender (`.blend`) fájlban van: ez tartalmazza a 3D modellt és a belőle generált
+vágási rajzokat. A lézervágáshoz szükséges lapokat a **BLECOLAC** Blender-kiegészítővel
+generáltuk a 3D modellből.
+
 ## Projekt felépítése
 
 ```
