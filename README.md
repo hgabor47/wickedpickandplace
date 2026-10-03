@@ -52,6 +52,14 @@ hanem **tárgyak felszedésére és lerakására** építettünk:
 | Kezelőfelület       | 8 nyomógomb                               |
 | Kommunikáció        | WiFi (STA/AP), webes UI, OTA              |
 
+## Áramköri séma
+
+<div align="center">
+  <img src="assets/circuit_schema_v19.png" alt="ESP32 Polargraph áramköri séma (v19, IBT-2 PWM elektromágnes)" width="900">
+</div>
+
+Teljes, interaktív verzió: [circuit_schema_v19.html](circuit_schema_v19.html).
+
 ## Projekt felépítése
 
 ```

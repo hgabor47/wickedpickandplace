@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<title>Áramköri séma – ESP32 Polargraph (IBT-2 elektromágnes)</title>
+<style>
+  body { font-family: 'Segoe UI', Consolas, monospace; background:#f4f4f4; margin:0; padding:20px; }
+  h1 { font-size:18px; color:#222; margin:0 0 6px 0; }
+  .legend { font-size:12px; color:#444; margin-bottom:14px; }
+  .legend b { padding:0 10px 0 4px; }
+  #viz { background:#fff; border:1px solid #ddd; border-radius:6px; overflow:auto; }
+</style>
+</head>
+<body>
+  <h1>ESP32-WROVER-B Polargraph – áramköri séma (v2: IBT-2 PWM elektromágnes)</h1>
+  <div class="legend">
+    Hálózatok:
+    <b style="color:#c0392b">■ 12V</b>
+    <b style="color:#e67e22">■ 3.3V</b>
+    <b style="color:#333">■ GND</b>
+    <b style="color:#16a085">— jelvezeték (GPIO)</b>
+  </div>
+  <div id="viz"></div>
+
+<script>
+const NET_COLORS = { V12:'#c0392b', V33:'#e67e22', GND:'#333333' };
+const ROWH = 22, HEAD = 28;
+
+function comp(id, label, x, y, w, pins) {
+  return { id, label, x, y, w, pins, h: HEAD + pins.length * ROWH };
+}
+
+const components = {};
+
+components.PSU = comp('PSU', '12V tápegység', 40, 40, 190, [
+  { name:'+12V', net:'V12' },
+  { name:'GND',  net:'GND' }
+]);
+
+components.BUCK = comp('BUCK', 'Step-down 12V→3.3V modul', 40, components.PSU.y + components.PSU.h + 40, 210, [
+  { name:'IN',       net:'V12' },
+  { name:'OUT 3.3V', net:'V33' },
+  { name:'GND',      net:'GND' }
+]);
+
+components.ESP = comp('ESP', 'TTGO ESP32-WROVER-B', 40, components.BUCK.y + components.BUCK.h + 40, 290, [
+  { name:'3V3 (közvetlen, VIN mellőzve)', net:'V33' },
+  { name:'GND', net:'GND' },
+  { name:'GPIO25' }, { name:'GPIO26' }, { name:'GPIO27' }, { name:'GPIO14 (TMS)' },
+  { name:'GPIO13 (TCK)' },
+  { name:'GPIO32 (PWM)' }, { name:'GPIO33' }, { name:'GPIO21' },
+  { name:'GPIO4'  }, { name:'GPIO5'  }, { name:'GPIO18' }, { name:'GPIO19' },
+  { name:'GPIO34' }, { name:'GPIO23' }, { name:'GPIO36 (SVP)' }, { name:'GPIO39 (SVN)' }
+]);
+
+const RX = 680;
+
+components.A1 = comp('A1', 'TMC2209 #1 – Motor A driver', RX, 40, 260, [
+  { name:'VM',               net:'V12' },
+  { name:'GND (power)',      net:'GND' },
+  { name:'VIO',              net:'V33' },
+  { name:'GND (logika)',     net:'GND' },
+  { name:'STEP' }, { name:'DIR' }, { name:'EN' },
+  { name:'MS1 (V33 HIGH)',   net:'V33' },
+  { name:'MS2 (GND LOW)',    net:'GND' },
+  { name:'CLK',              net:'GND' },
+  { name:'INDEX, DIAG, VREF (NC - hajlítva/vágva)' },
+  { name:'A1/A2/B1/B2 → Motor A tekercs' }
+]);
+
+components.A2 = comp('A2', 'TMC2209 #2 – Motor B driver', RX, components.A1.y + components.A1.h + 30, 260, [
+  { name:'VM',               net:'V12' },
+  { name:'GND (power)',      net:'GND' },
+  { name:'VIO',              net:'V33' },
+  { name:'GND (logika)',     net:'GND' },
+  { name:'STEP' }, { name:'DIR' }, { name:'EN' },
+  { name:'MS1 (V33 HIGH)',   net:'V33' },
+  { name:'MS2 (GND LOW)',    net:'GND' },
+  { name:'CLK',              net:'GND' },
+  { name:'INDEX, DIAG, VREF (NC - hajlítva/vágva)' },
+  { name:'A1/A2/B1/B2 → Motor B tekercs' }
+]);
+
+components.IBT2 = comp('IBT2', 'IBT-2 (BTS7960) – elektromágnes driver', RX, components.A2.y + components.A2.h + 30, 260, [
+  { name:'VCC (logika, 3.3-5V)', net:'V33' },
+  { name:'GND',          net:'GND' },
+  { name:'RPWM' },
+  { name:'R_EN' },
+  { name:'L_EN (R_EN-nel közösítve)' },
+  { name:'LPWM (irany/gyors elengedes)' },
+  { name:'B+ (táp be)', net:'V12' },
+  { name:'B- (táp be)', net:'GND' },
+  { name:'M+ (motor/tekercs ki)' },
+  { name:'M- (motor/tekercs ki)' }
+]);
+
+const RX2 = RX + 320 + 60;
+components.COIL = comp('COIL', 'Elektromágnes (saját tekercs, ~2.2Ω, 450 menet)', RX2, components.IBT2.y, 230, [
+  { name:'+ (tekercs vég 1)' },
+  { name:'- (tekercs vég 2)' }
+]);
+
+components.BTN1_4 = comp('BTN1_4', 'Gomb 1–4 (belső + külső 4.7k pull-up, 70cm kábel)', RX, components.IBT2.y + components.IBT2.h + 30, 320, [
+  { name:'GPIO4 (Gomb 1) + 100nF GPIO-GND' },
+  { name:'GPIO5 (Gomb 2) + 100nF GPIO-GND' },
+  { name:'GPIO18 (Gomb 3) + 100nF GPIO-GND' },
+  { name:'GPIO19 (Gomb 4) + 100nF GPIO-GND' },
+  { name:'GND (dedikált visszavezetés)', net:'GND' }
+]);
+
+components.BTN5_8 = comp('BTN5_8', 'Gomb 5,7,8 külső 4.7k / Gomb 6 GPIO23 belső+külső, 70cm kábel', RX, components.BTN1_4.y + components.BTN1_4.h + 30, 320, [
+  { name:'GPIO34 (Gomb 5) + 100nF GPIO-GND' },
+  { name:'GPIO23 (Gomb 6) + belso+kulso 4.7k + 100nF' },
+  { name:'GPIO36 (Gomb 7) + 100nF GPIO-GND' },
+  { name:'GPIO39 (Gomb 8) + 100nF GPIO-GND' },
+  { name:'GND (dedikált visszavezetés)', net:'GND' }
+]);
+
+const cableNote = {
+  x: RX, y: components.BTN5_8.y + components.BTN5_8.h + 30, w: 320,
+  lines: [
+    'Kábelezési megjegyzés (8 gomb, ~70cm):',
+    '– 1 db többeres (10 ér: 8 jel + 1 GND + 1 V33) kábelben fusson mind',
+    '– GND-visszavezetés dedikált, ne osztott földpont legyen',
+    '– 0.5m-nél: 1µF a V33-GND közé (kábelen, egyszer)',
+    '– onnan 10cm-en belül a gomboknál: 4.7k pull-up + 100nF GPIO-GND',
+    '– ne fusson párhuzamosan a motor/mágnes vezetékeivel'
+  ]
+};
+
+function pinY(c, i) { return c.y + HEAD + i * ROWH + ROWH / 2; }
+
+const wires = [
+  { from:['ESP',2],  to:['A1',4],    label:'GPIO25 STEP' },
+  { from:['ESP',3],  to:['A1',5],    label:'GPIO26 DIR'  },
+  { from:['ESP',4],  to:['A2',4],    label:'GPIO27 STEP' },
+  { from:['ESP',5],  to:['A2',5],    label:'GPIO14 DIR'  },
+  { from:['ESP',6],  to:['A1',6],    label:'GPIO13 EN'   },
+  { from:['ESP',6],  to:['A2',6],    label:'GPIO13 EN'   },
+  { from:['ESP',7],  to:['IBT2',2],  label:'GPIO32 RPWM (1kHz)' },
+  { from:['ESP',8],  to:['IBT2',3],  label:'GPIO33 R_EN' },
+  { from:['ESP',8],  to:['IBT2',4],  label:'GPIO33 L_EN' },
+  { from:['ESP',9],  to:['IBT2',5],  label:'GPIO21 LPWM' },
+  { from:['IBT2',8], to:['COIL',0],  label:'M+' },
+  { from:['IBT2',9], to:['COIL',1],  label:'M-' },
+  { from:['ESP',10], to:['BTN1_4',0],label:'GPIO4'  },
+  { from:['ESP',11], to:['BTN1_4',1],label:'GPIO5'  },
+  { from:['ESP',12], to:['BTN1_4',2],label:'GPIO18' },
+  { from:['ESP',13], to:['BTN1_4',3],label:'GPIO19' },
+  { from:['ESP',14], to:['BTN5_8',0],label:'GPIO34' },
+  { from:['ESP',15], to:['BTN5_8',1],label:'GPIO23' },
+  { from:['ESP',16], to:['BTN5_8',2],label:'GPIO36' },
+  { from:['ESP',17], to:['BTN5_8',3],label:'GPIO39' }
+];
+
+let svg = [];
+
+Object.values(components).forEach(c => {
+  svg.push(`<rect x="${c.x}" y="${c.y}" width="${c.w}" height="${c.h}" fill="#fff" stroke="#222" stroke-width="1.5" rx="4"/>`);
+  svg.push(`<rect x="${c.x}" y="${c.y}" width="${c.w}" height="${HEAD}" fill="#222" rx="4"/>`);
+  svg.push(`<text x="${c.x + c.w/2}" y="${c.y + 18}" font-size="12.5" fill="#fff" text-anchor="middle" font-weight="bold">${c.label}</text>`);
+
+  c.pins.forEach((p, i) => {
+    const rowBottom = c.y + HEAD + (i + 1) * ROWH;
+    const y = pinY(c, i);
+    if (i < c.pins.length - 1) {
+      svg.push(`<line x1="${c.x}" y1="${rowBottom}" x2="${c.x + c.w}" y2="${rowBottom}" stroke="#eee"/>`);
+    }
+    svg.push(`<text x="${c.x + 10}" y="${y + 4}" font-size="12" fill="#333">${p.name}</text>`);
+    if (p.net) {
+      svg.push(`<text x="${c.x + c.w - 10}" y="${y + 4}" font-size="12" fill="${NET_COLORS[p.net]}" text-anchor="end" font-weight="bold">${p.net}</text>`);
+    }
+  });
+});
+
+// Csak azokban a pontokban rajzolunk junction-gombócot, ahol TÉNYLEGESEN
+// több vezeték indul ugyanabból a pontból (valódi elágazás, pl. GPIO13 EN
+// két driverhez). Ahol csak egy vezeték fut be egy pinbe, nincs gombóc.
+const fromKeyCounts = {};
+wires.forEach(w => {
+  const k = w.from.join(',');
+  fromKeyCounts[k] = (fromKeyCounts[k] || 0) + 1;
+});
+const drawnJunctions = new Set();
+
+wires.forEach((w, idx) => {
+  const fc = components[w.from[0]], tc = components[w.to[0]];
+  const fy = pinY(fc, w.from[1]);
+  const ty = pinY(tc, w.to[1]);
+  const fx = fc.x + fc.w, tx = tc.x;
+
+  // sima S-görbe (bezier) - a görbület a start/end y-különbségéből adódik,
+  // így az egymás melletti vezetékek természetesen szétválnak, nem fedik egymást
+  const dx = tx - fx;
+  const c1x = fx + dx * 0.55;
+  const c2x = tx - dx * 0.55;
+  svg.push(`<path d="M ${fx} ${fy} C ${c1x} ${fy}, ${c2x} ${ty}, ${tx} ${ty}" fill="none" stroke="#16a085" stroke-width="1.5"/>`);
+
+  const fkey = w.from.join(',');
+  if (fromKeyCounts[fkey] > 1 && !drawnJunctions.has(fkey)) {
+    svg.push(`<circle cx="${fx}" cy="${fy}" r="3.5" fill="#16a085"/>`);
+    drawnJunctions.add(fkey);
+  }
+
+  const midX = (c1x + c2x) / 2;
+  svg.push(`<text x="${midX + 4}" y="${(fy + ty) / 2 - 6}" font-size="10" fill="#16a085">${w.label}</text>`);
+});
+
+const noteH = 24 + cableNote.lines.length * 18;
+svg.push(`<rect x="${cableNote.x}" y="${cableNote.y}" width="${cableNote.w}" height="${noteH}" fill="#fffbe6" stroke="#d4a017" stroke-width="1.5" rx="4"/>`);
+cableNote.lines.forEach((line, i) => {
+  svg.push(`<text x="${cableNote.x + 10}" y="${cableNote.y + 20 + i * 18}" font-size="${i === 0 ? 12 : 11}" fill="#7a5c00" font-weight="${i === 0 ? 'bold' : 'normal'}">${line}</text>`);
+});
+
+// ============ EGYEDI FELHÚZÓ ELLENÁLLÁSOK (Gomb 5-8) ============
+function drawVerticalResistor(x, yTop, yBottom, label) {
+  const midY = (yTop + yBottom) / 2;
+  const boxH = 22;
+  svg.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${midY - boxH/2}" stroke="#e67e22" stroke-width="1.3"/>`);
+  svg.push(`<rect x="${x - 6}" y="${midY - boxH/2}" width="12" height="${boxH}" fill="#fff" stroke="#e67e22" stroke-width="1.3"/>`);
+  svg.push(`<line x1="${x}" y1="${midY + boxH/2}" x2="${x}" y2="${yBottom}" stroke="#e67e22" stroke-width="1.3"/>`);
+  svg.push(`<text x="${x + 9}" y="${midY + 3}" font-size="9" fill="#e67e22">${label}</text>`);
+}
+
+// ============ PUFFER-KONDENZÁTOROK (A1, A2 VMOT-GND) ============
+function drawVerticalCap(x, yTop, yBottom, label) {
+  const midY = (yTop + yBottom) / 2;
+  const gap = 5;
+  svg.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${midY - gap}" stroke="#c0392b" stroke-width="1.3"/>`);
+  svg.push(`<line x1="${x - 9}" y1="${midY - gap}" x2="${x + 9}" y2="${midY - gap}" stroke="#c0392b" stroke-width="2"/>`);
+  svg.push(`<line x1="${x - 9}" y1="${midY + gap}" x2="${x + 9}" y2="${midY + gap}" stroke="#c0392b" stroke-width="2"/>`);
+  svg.push(`<line x1="${x}" y1="${midY + gap}" x2="${x}" y2="${yBottom}" stroke="#c0392b" stroke-width="1.3"/>`);
+  svg.push(`<text x="${x - 14}" y="${midY - gap - 3}" font-size="10" fill="#c0392b" text-anchor="end">+</text>`);
+  svg.push(`<text x="${x + 13}" y="${midY + 3}" font-size="9" fill="#c0392b">${label}</text>`);
+}
+
+[components.A1, components.A2].forEach(c => {
+  const capX = c.x - 30;
+  const yVmot = pinY(c, 0); // VM sor
+  const yGnd  = pinY(c, 1); // GND (power) sor
+  drawVerticalCap(capX, yVmot, yGnd, '470µF 16V');
+  svg.push(`<line x1="${capX}" y1="${yVmot}" x2="${c.x}" y2="${yVmot}" stroke="#c0392b" stroke-width="1.3"/>`);
+  svg.push(`<line x1="${capX}" y1="${yGnd}" x2="${c.x}" y2="${yGnd}" stroke="#c0392b" stroke-width="1.3"/>`);
+  svg.push(`<circle cx="${c.x}" cy="${yVmot}" r="3" fill="#c0392b"/>`);
+  svg.push(`<circle cx="${c.x}" cy="${yGnd}" r="3" fill="#333"/>`);
+});
+
+// IBT-2 melletti nagy puffer-kondi a 12V sínen (a mágnes boost-pulzusához)
+{
+  const c = components.IBT2;
+  const capX = c.x - 30;
+  const yBplus  = pinY(c, 6); // B+ sor
+  const yBminus = pinY(c, 7); // B- sor
+  drawVerticalCap(capX, yBplus, yBminus, '1000µF 16V');
+  svg.push(`<line x1="${capX}" y1="${yBplus}" x2="${c.x}" y2="${yBplus}" stroke="#c0392b" stroke-width="1.3"/>`);
+  svg.push(`<line x1="${capX}" y1="${yBminus}" x2="${c.x}" y2="${yBminus}" stroke="#c0392b" stroke-width="1.3"/>`);
+  svg.push(`<circle cx="${c.x}" cy="${yBplus}" r="3" fill="#c0392b"/>`);
+  svg.push(`<circle cx="${c.x}" cy="${yBminus}" r="3" fill="#333"/>`);
+}
+
+// ============ 100nF SZŰRŐKONDIK A GOMBOKNÁL ============
+function drawSmallCeramicCap(x, yStart) {
+  const y1 = yStart + 6, y2 = yStart + 12, yEnd = yStart + 20;
+  svg.push(`<line x1="${x}" y1="${yStart}" x2="${x}" y2="${y1}" stroke="#333" stroke-width="1.1"/>`);
+  svg.push(`<line x1="${x - 6}" y1="${y1}" x2="${x + 6}" y2="${y1}" stroke="#333" stroke-width="1.6"/>`);
+  svg.push(`<line x1="${x - 6}" y1="${y2}" x2="${x + 6}" y2="${y2}" stroke="#333" stroke-width="1.6"/>`);
+  svg.push(`<line x1="${x}" y1="${y2}" x2="${x}" y2="${yEnd}" stroke="#333" stroke-width="1.1"/>`);
+  svg.push(`<circle cx="${x}" cy="${yEnd}" r="2.5" fill="#333"/>`);
+  svg.push(`<text x="${x + 9}" y="${(y1 + y2) / 2 + 3}" font-size="8.5" fill="#333">100nF</text>`);
+}
+
+[components.BTN1_4, components.BTN5_8].forEach(bc => {
+  for (let i = 0; i < 4; i++) {
+    const capX = bc.x + bc.w + 14;
+    const rowY = pinY(bc, i);
+    svg.push(`<line x1="${bc.x + bc.w}" y1="${rowY}" x2="${capX}" y2="${rowY}" stroke="#333" stroke-width="1.1"/>`);
+    svg.push(`<circle cx="${bc.x + bc.w}" cy="${rowY}" r="2.5" fill="#16a085"/>`); // junction: ESP jel + szűrőkondi ugyanoda
+    drawSmallCeramicCap(capX, rowY);
+  }
+});
+
+// Gomb 1-4: belső pull-up MELLETT kulso 4.7k is (parhuzamosan, ~4.25k eredo)
+const pullupBusY1 = components.BTN1_4.y - 22;
+const pullupResX1 = [components.BTN1_4.x - 150, components.BTN1_4.x - 115, components.BTN1_4.x - 80, components.BTN1_4.x - 45];
+svg.push(`<line x1="${pullupResX1[0]}" y1="${pullupBusY1}" x2="${pullupResX1[3]}" y2="${pullupBusY1}" stroke="#e67e22" stroke-width="1.3"/>`);
+svg.push(`<text x="${pullupResX1[0] - 30}" y="${pullupBusY1 + 4}" font-size="11" fill="#e67e22" font-weight="bold">V33</text>`);
+for (let i = 0; i < 4; i++) {
+  const rowY = pinY(components.BTN1_4, i);
+  drawVerticalResistor(pullupResX1[i], pullupBusY1, rowY, '4.7k');
+  svg.push(`<line x1="${pullupResX1[i]}" y1="${rowY}" x2="${components.BTN1_4.x}" y2="${rowY}" stroke="#e67e22" stroke-width="1.3"/>`);
+  svg.push(`<circle cx="${components.BTN1_4.x}" cy="${rowY}" r="3.5" fill="#16a085"/>`);
+}
+
+// Gomb 5-8: kulso 4.7k pull-up (nincs belso, mert GPIO34-39 input-only labak)
+const pullupBusY = components.BTN5_8.y - 40;
+const pullupResX = [components.BTN5_8.x - 150, components.BTN5_8.x - 115, components.BTN5_8.x - 80, components.BTN5_8.x - 45];
+svg.push(`<line x1="${pullupResX[0]}" y1="${pullupBusY}" x2="${pullupResX[3]}" y2="${pullupBusY}" stroke="#e67e22" stroke-width="1.3"/>`);
+svg.push(`<text x="${pullupResX[0] - 30}" y="${pullupBusY + 4}" font-size="11" fill="#e67e22" font-weight="bold">V33</text>`);
+
+for (let i = 0; i < 4; i++) {
+  const rowY = pinY(components.BTN5_8, i);
+  drawVerticalResistor(pullupResX[i], pullupBusY, rowY, '4.7k');
+  svg.push(`<line x1="${pullupResX[i]}" y1="${rowY}" x2="${components.BTN5_8.x}" y2="${rowY}" stroke="#e67e22" stroke-width="1.3"/>`);
+  // valódi junction: itt fut be az ESP-jelvezeték is ugyanabba a pontba
+  svg.push(`<circle cx="${components.BTN5_8.x}" cy="${rowY}" r="3.5" fill="#16a085"/>`);
+}
+
+const maxY = Math.max(
+  Math.max(...Object.values(components).map(c => c.y + c.h)),
+  cableNote.y + noteH
+) + 20;
+const maxX = Math.max(RX + 320, RX2 + 230) + 90;
+document.getElementById('viz').innerHTML =
+  `<svg viewBox="0 0 ${maxX} ${maxY}" width="100%">${svg.join('')}</svg>`;
+</script>
+</body>
+</html>
