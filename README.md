@@ -93,6 +93,14 @@ platformio.ini      - PlatformIO projekt- és környezetkonfiguráció
 
 ## Gyors start
 
+A WiFi hitelesítő adatok nincsenek verziókezelve. Build előtt hozd létre a saját
+`include/secrets.h` fájlt a sablon alapján:
+
+```bash
+cp include/secrets.example.h include/secrets.h
+# majd szerkeszd az include/secrets.h-t a saját SSID/jelszó adataiddal
+```
+
 Részletes fejlesztői útmutatóért (szükséges könyvtárak, WiFi-viselkedés, mindkét
 OTA-mód lépésről lépésre, hibaelhárítási táblázat) lásd a [src/Readme.md](src/Readme.md) fájlt.
 
