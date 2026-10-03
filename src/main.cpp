@@ -357,16 +357,10 @@ struct QueueItem {
 QueueHandle_t motionQueue;
 
 // ============ WIFI: ISMERT HÁLÓZATOK, AP-FALLBACK ============
-struct WifiCred { const char* ssid; const char* password; };
-const WifiCred KNOWN_NETWORKS[] = {
-  { "HGPLSOFT3",         "***REMOVED***" },
-  { "HGPLSOFT",          "***REMOVED***" },
-  { "HGPLSOFT_EXT2.4G",  "***REMOVED***" }
-};
-const int KNOWN_NETWORK_COUNT = sizeof(KNOWN_NETWORKS) / sizeof(KNOWN_NETWORKS[0]);
+// A valós SSID/jelszó adatok a (verziókezelésből kizárt) secrets.h-ban vannak,
+// lásd include/secrets.example.h sablont.
+#include "secrets.h"
 
-const char* AP_SSID     = "WICKEDPAP";
-const char* AP_PASSWORD = "***REMOVED***";
 const char* MDNS_HOSTNAME = "wickedpickandplace";
 
 AsyncWebServer server(80);
