@@ -55,7 +55,7 @@ kulissza pozícióját a damilhosszak változtatásával lehet vezérelni), ami
 | Komponens          | Eszköz                                   |
 | ------------------- | ----------------------------------------- |
 | Mikrovezérlő       | ESP32-WROVER-B (TTGO T7 V1.3)             |
-| Léptetőmotorok     | 2× A4988 meghajtó, 1.8°/lépés, 1/16 microstepping |
+| Léptetőmotorok     | 2× léptetőmotor-meghajtó (STEP/DIR), 1.8°/lépés, 1/16 microstepping — tervben A4988, a végleges áramkörben TMC2209 |
 | Elektromágnes       | Saját tekercselésű, IBT-2/BTS7960 PWM-meghajtóval, a rekesz-ajtók (kártyák) felszippantására |
 | Kezelőfelület       | 8 nyomógomb                               |
 | Kommunikáció        | WiFi (STA/AP), webes UI, OTA              |
